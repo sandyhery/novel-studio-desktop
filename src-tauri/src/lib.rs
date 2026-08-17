@@ -2405,6 +2405,176 @@ fn git_commit_novel(root: &Path, chapter_file: &str, revised: bool) -> Result<()
     Ok(())
 }
 
+/// 手动/里程碑提交的结果（前端用来展示提交状态与 hash）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitResult {
+    pub repo_exists: bool,
+    pub committed: bool,
+    pub message: String,
+    pub hash: Option<String>,
+    pub summary: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitInitResult {
+    pub ok: bool,
+    pub repo_exists: bool,
+    pub summary: String,
+}
+
+/// 在小说项目里做一次快照提交（git add -A + commit）。
+/// - 项目没 .git → 返回 repo_exists=false（前端提示「初始化 Git」）
+/// - 没有改动 → committed=false、summary=「没有需要提交的改动」
+/// - 成功 → committed=true + 短 hash
+#[tauri::command]
+fn git_commit(root: String, message: Option<String>) -> Result<GitCommitResult, String> {
+    use std::process::Command;
+
+    let start = PathBuf::from(&root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let dir = novel_root.to_string_lossy().to_string();
+    let msg = message
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| "快照".to_string());
+
+    let no_repo = GitCommitResult {
+        repo_exists: false,
+        committed: false,
+        message: msg.clone(),
+        hash: None,
+        summary: "项目还未初始化 Git，点击「初始化 Git」".into(),
+    };
+    if !novel_root.join(".git").exists() {
+        return Ok(no_repo);
+    }
+
+    // 没有改动就不提交
+    match Command::new("git").args(["-C", &dir, "status", "--porcelain"]).output() {
+        Ok(o) if o.stdout.is_empty() => {
+            return Ok(GitCommitResult {
+                repo_exists: true,
+                committed: false,
+                message: msg.clone(),
+                hash: None,
+                summary: "没有需要提交的改动".into(),
+            });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Ok(GitCommitResult {
+                repo_exists: true,
+                committed: false,
+                message: msg.clone(),
+                hash: None,
+                summary: format!("git status 失败：{e}"),
+            });
+        }
+    }
+
+    // add + commit
+    let add = Command::new("git").args(["-C", &dir, "add", "-A"]).output();
+    match add {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            return Ok(GitCommitResult {
+                repo_exists: true,
+                committed: false,
+                message: msg.clone(),
+                hash: None,
+                summary: format!("git add 失败：{}", truncate_str(&String::from_utf8_lossy(&o.stderr), 200)),
+            });
+        }
+        Err(e) => {
+            return Ok(GitCommitResult {
+                repo_exists: true,
+                committed: false,
+                message: msg.clone(),
+                hash: None,
+                summary: format!("git add 失败：{e}"),
+            });
+        }
+    }
+
+    match Command::new("git").args(["-C", &dir, "commit", "-m", &msg]).output() {
+        Ok(o) if o.status.success() => {
+            let hash = Command::new("git")
+                .args(["-C", &dir, "rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .map(|h| String::from_utf8_lossy(&h.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            let short = hash.clone().unwrap_or_default();
+            Ok(GitCommitResult {
+                repo_exists: true,
+                committed: true,
+                message: msg.clone(),
+                hash,
+                summary: format!("已提交 {short}"),
+            })
+        }
+        Ok(o) => Ok(GitCommitResult {
+            repo_exists: true,
+            committed: false,
+            message: msg.clone(),
+            hash: None,
+            summary: format!(
+                "提交失败：{}",
+                truncate_str(&String::from_utf8_lossy(&o.stderr), 200)
+            ),
+        }),
+        Err(e) => Ok(GitCommitResult {
+            repo_exists: true,
+            committed: false,
+            message: msg.clone(),
+            hash: None,
+            summary: format!("提交失败：{e}"),
+        }),
+    }
+}
+
+/// 在小说项目根执行 `git init`（幂等：已存在则直接返回成功）。
+#[tauri::command]
+fn git_init(root: String) -> Result<GitInitResult, String> {
+    use std::process::Command;
+
+    let start = PathBuf::from(&root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let dir = novel_root.to_string_lossy().to_string();
+
+    if novel_root.join(".git").exists() {
+        return Ok(GitInitResult {
+            ok: true,
+            repo_exists: true,
+            summary: "Git 仓库已存在".into(),
+        });
+    }
+    match Command::new("git").args(["-C", &dir, "init"]).output() {
+        Ok(o) if o.status.success() => Ok(GitInitResult {
+            ok: true,
+            repo_exists: true,
+            summary: "已初始化 Git 仓库".into(),
+        }),
+        Ok(o) => Err(format!(
+            "git init 失败：{}",
+            truncate_str(&String::from_utf8_lossy(&o.stderr), 200)
+        )),
+        Err(e) => Err(format!("git init 失败：{e}")),
+    }
+}
+
+/// 截断字符串到最多 n 个字符（按字符边界，避免切坏 UTF-8）。
+fn truncate_str(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
 /// 解析 `### FILE: <path>\n<content>\n### END` 块
 fn split_file_blocks(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -2644,7 +2814,9 @@ pub fn run() {
             ai_review_chapter,
             ai_revise_chapter,
             ai_full_pipeline,
-            read_story_spine
+            read_story_spine,
+            git_commit,
+            git_init
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2881,6 +3053,41 @@ mod tests {
         // 清理 smoke 数据（让用户从 UI 真正走一遍时是干净的）
         let _ = fs::remove_dir_all(path.join(".ai-novel"));
         eprintln!("(清理 .ai-novel smoke 用例数据)");
+    }
+
+    /// git init → commit → 再 commit（无改动）的完整回路。不依赖 GUI，纯本地 git。
+    #[test]
+    fn git_init_commit_roundtrip() {
+        use std::process::Command;
+        let _guard = lock_real_dir();
+        let p = std::env::temp_dir().join("dsh-novel-git-test");
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(p.join("bible")).unwrap();
+        fs::create_dir_all(p.join("chapters")).unwrap();
+        fs::write(p.join("state.yml"), "title: t\ncurrent_chapter: 1\n").unwrap();
+        fs::write(p.join("chapters").join("ch01.md"), "# 第一章\n正文\n").unwrap();
+        let root = p.to_string_lossy().to_string();
+
+        // 未 init → repo_exists=false
+        let r = git_commit(root.clone(), Some("m".into())).expect("commit call");
+        assert!(!r.repo_exists, "未初始化应报 repo_exists=false，got {}", r.summary);
+
+        let gi = git_init(root.clone()).expect("init ok");
+        assert!(gi.ok && gi.repo_exists, "init 应成功");
+
+        // 保证本地身份，避免 commit 因缺 user.name/email 失败
+        let _ = Command::new("git").args(["-C", root.as_str(), "config", "user.name", "test"]).output();
+        let _ = Command::new("git").args(["-C", root.as_str(), "config", "user.email", "test@example.com"]).output();
+
+        let r2 = git_commit(root.clone(), Some("里程碑".into())).expect("commit call");
+        assert!(r2.committed, "首次提交应成功，got {}", r2.summary);
+        assert!(r2.hash.is_some(), "应返回短 hash");
+
+        let r3 = git_commit(root.clone(), Some("again".into())).expect("commit call");
+        assert!(!r3.committed, "无改动不应再提交");
+        assert!(r3.summary.contains("没有需要提交的改动"), "got {}", r3.summary);
+
+        let _ = fs::remove_dir_all(&p);
     }
 
     /// 端到端：真实驱动 DSH agent 写一章（需要 dsh web 在 3080 跑着）。

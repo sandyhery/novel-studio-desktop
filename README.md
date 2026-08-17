@@ -87,5 +87,5 @@ invoke("write_chapter", { args: { root, file, content } })  // 保存
 4. 写作中字体、行距切换 → 已实现（字号 14~22 / 行距 4 档，localStorage 记忆）
 5. 阅读模式 / 全屏沉浸模式 → 已实现（Markdown 排版阅读 + 隐藏界面全屏沉浸）
 6. 章节字数目标达成 banner → 已实现（按单章建议字数显示进度与达标提示）
-7. 写满 N 章后自动 git commit → 待办
+7. 写满 N 章后自动 git commit → 已实现（每 N 章里程碑自动快照 + 手动提交 + 一键初始化 Git）
 8. 与 dsh-novel-studio 的 read/write API 双向打通（同一份小说双端可编辑）→ 设计中

@@ -327,3 +327,21 @@ export interface AiFullPipelineResult {
 
 /** 审核问题类别顺序 */
 export const REVIEW_CATEGORY_ORDER = ["A", "B", "C", "D", "P"] as const;
+
+// ---------------------------------------------------------------------------
+// Git 快照 / 里程碑自动提交
+// ---------------------------------------------------------------------------
+
+export interface GitCommitResult {
+  repoExists: boolean;
+  committed: boolean;
+  message: string;
+  hash: string | null;
+  summary: string;
+}
+
+export interface GitInitResult {
+  ok: boolean;
+  repoExists: boolean;
+  summary: string;
+}

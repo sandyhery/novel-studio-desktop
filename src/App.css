@@ -1142,3 +1142,56 @@ code {
   flex: 1;
   min-height: 0;
 }
+
+/* ---------- Git 快照 ---------- */
+
+.git-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 13px;
+}
+.git-notice.ok {
+  border-color: var(--success);
+  background: rgba(63, 185, 80, 0.08);
+  color: var(--success);
+}
+.git-notice.warn {
+  border-color: var(--warn);
+  background: rgba(227, 179, 65, 0.08);
+  color: var(--warn);
+}
+.git-notice.error {
+  border-color: var(--danger);
+  background: rgba(248, 81, 73, 0.08);
+  color: var(--danger);
+}
+.git-notice-text { flex: 1; }
+.git-notice .btn.ghost { color: inherit; }
+
+.git-snapshot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.git-snapshot-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.git-snapshot-title { font-weight: 600; font-size: 13px; }
+.git-snapshot-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}

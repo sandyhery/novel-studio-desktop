@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import type { BibleMeta, Chapter, NovelState, NovelSummary, Probe } from "./types";
+import type { BibleMeta, Chapter, GitCommitResult, GitInitResult, NovelState, NovelSummary, Probe } from "./types";
 import { fmtChars, fmtDate } from "./types";
 import CreateNovelModal from "./CreateNovelModal";
 import StoryboardPanel from "./StoryboardPanel";
@@ -50,6 +50,8 @@ export default function App() {
   const [immersed, setImmersed] = useState(false);
   const [fontSize, setFontSize] = useState<number>(() => readPrefNumber("novelStudio.fontSize", 16, 12, 32));
   const [lineHeight, setLineHeight] = useState<number>(() => readPrefNumber("novelStudio.lineHeight", 1.85, 1.2, 3));
+  const [milestoneEvery, setMilestoneEvery] = useState<number>(() => readPrefNumber("novelStudio.milestoneEvery", 5, 0, 100));
+  const [gitNotice, setGitNotice] = useState<{ text: string; tone: "ok" | "warn" | "error" } | null>(null);
 
   const changeFontSize = useCallback((n: number) => {
     setFontSize(n);
@@ -61,6 +63,11 @@ export default function App() {
     try { localStorage.setItem("novelStudio.lineHeight", String(n)); } catch { /* ignore */ }
   }, []);
 
+  const changeMilestoneEvery = useCallback((n: number) => {
+    setMilestoneEvery(n);
+    try { localStorage.setItem("novelStudio.milestoneEvery", String(n)); } catch { /* ignore */ }
+  }, []);
+
   const toggleImmerse = useCallback(async () => {
     const next = !immersed;
     setImmersed(next);
@@ -70,6 +77,61 @@ export default function App() {
       // OS 全屏失败也不影响：CSS 沉浸层仍会隐藏顶部/侧栏
     }
   }, [immersed]);
+
+  const doCommit = useCallback(
+    async (message?: string): Promise<GitCommitResult | null> => {
+      const r = summary?.root;
+      if (!r) return null;
+      try {
+        const res = await invoke<GitCommitResult>("git_commit", {
+          root: r,
+          message: message ?? null,
+        });
+        setGitNotice({
+          text: res.summary,
+          tone: res.committed ? "ok" : "warn",
+        });
+        return res;
+      } catch (e) {
+        setGitNotice({ text: `提交失败：${String(e)}`, tone: "error" });
+        return null;
+      }
+    },
+    [summary?.root],
+  );
+
+  const doInit = useCallback(async () => {
+    const r = summary?.root;
+    if (!r) return;
+    try {
+      const res = await invoke<GitInitResult>("git_init", { root: r });
+      setGitNotice({ text: res.summary, tone: res.ok ? "ok" : "error" });
+      if (res.ok && res.repoExists) {
+        await doCommit("初始化快照");
+      }
+    } catch (e) {
+      setGitNotice({ text: `初始化失败：${String(e)}`, tone: "error" });
+    }
+  }, [summary?.root, doCommit]);
+
+  // 里程碑自动提交：新增一章后，若章节数达到 N 的倍数，自动 git 快照。
+  const prevChapterCountRef = useRef<number | null>(null);
+  const lastRootRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!summary) return; // loadSummary 中间态（summary=null）不动 refs
+    if (summary.root !== lastRootRef.current) {
+      lastRootRef.current = summary.root;
+      prevChapterCountRef.current = summary.chapters.length;
+      return;
+    }
+    const count = summary.chapters.length;
+    const prev = prevChapterCountRef.current ?? 0;
+    prevChapterCountRef.current = count;
+    if (count <= prev) return; // 没新增章节
+    if (milestoneEvery > 0 && count % milestoneEvery === 0) {
+      void doCommit(`里程碑：完成第 ${count} 章`);
+    }
+  }, [summary, milestoneEvery, doCommit]);
 
   const runProbe = useCallback(async (path: string) => {
     try {
@@ -338,6 +400,15 @@ export default function App() {
 
         <main className="main">
           {error && <div className="error-banner">{error}</div>}
+          {gitNotice && (
+            <div className={`git-notice ${gitNotice.tone}`}>
+              <span>{gitNotice.tone === "ok" ? "✅" : gitNotice.tone === "error" ? "❌" : "ℹ️"}</span>
+              <span className="git-notice-text">{gitNotice.text}</span>
+              <button className="btn ghost" onClick={() => setGitNotice(null)} title="关闭">
+                ✕
+              </button>
+            </div>
+          )}
 
           {!summary && !probe && !error && (
             <div className="empty">
@@ -387,6 +458,11 @@ export default function App() {
               bible={summary.bible}
               recent={summary.recentChapters}
               totalChars={totalChars}
+              chapterCount={summary.chapters.length}
+              milestoneEvery={milestoneEvery}
+              onMilestoneEvery={changeMilestoneEvery}
+              onCommit={() => doCommit()}
+              onInit={doInit}
               openChapter={(c) => {
                 openChapter(c);
                 setPanel("editor");
@@ -561,10 +637,27 @@ function OverviewPanel(props: {
   bible: BibleMeta;
   recent: Chapter[];
   totalChars: number;
+  chapterCount: number;
+  milestoneEvery: number;
+  onMilestoneEvery: (n: number) => void;
+  onCommit: () => void;
+  onInit: () => void;
   openChapter: (c: Chapter) => void;
   openBible: (file: string, display: string) => void;
 }) {
-  const { state, bible, recent, totalChars, openChapter, openBible } = props;
+  const {
+    state,
+    bible,
+    recent,
+    totalChars,
+    chapterCount,
+    milestoneEvery,
+    onMilestoneEvery,
+    onCommit,
+    onInit,
+    openChapter,
+    openBible,
+  } = props;
   return (
     <div className="panel">
       <div className="metric-row">
@@ -585,6 +678,32 @@ function OverviewPanel(props: {
           <div className="metric-label">总字数</div>
           <div className="metric-value">{fmtChars(totalChars)}</div>
           <div className="metric-hint">所有章节累加</div>
+        </div>
+      </div>
+
+      <div className="git-snapshot">
+        <div className="git-snapshot-head">
+          <span className="git-snapshot-title">💾 Git 快照</span>
+          <span className="muted small">当前 {chapterCount} 章</span>
+        </div>
+        <div className="git-snapshot-body">
+          <label className="ctl">
+            <span className="muted small">每</span>
+            <select
+              value={milestoneEvery}
+              onChange={(e) => onMilestoneEvery(Number(e.target.value))}
+            >
+              <option value={0}>关闭自动提交</option>
+              <option value={1}>1 章</option>
+              <option value={3}>3 章</option>
+              <option value={5}>5 章</option>
+              <option value={10}>10 章</option>
+            </select>
+            <span className="muted small">自动提交一次</span>
+          </label>
+          <div className="spacer" />
+          <button className="btn" onClick={onInit}>初始化 Git</button>
+          <button className="btn primary" onClick={onCommit}>立即提交</button>
         </div>
       </div>
 
