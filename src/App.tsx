@@ -5,8 +5,9 @@ import type { BibleMeta, Chapter, NovelState, NovelSummary, Probe } from "./type
 import { fmtChars, fmtDate } from "./types";
 import CreateNovelModal from "./CreateNovelModal";
 import StoryboardPanel from "./StoryboardPanel";
+import AiWritePanel from "./AiWritePanel";
 
-type Panel = "overview" | "chapters" | "bible" | "editor" | "storyboard";
+type Panel = "overview" | "chapters" | "bible" | "editor" | "storyboard" | "aiwrite";
 
 interface BibleSelection {
   /** "timeline" / "foreshadowing" / "characters/林楚" 这种带不带路径的 key */
@@ -28,6 +29,7 @@ export default function App() {
   const [chapterSaved, setChapterSaved] = useState<boolean>(true);
   const [saving, setSaving] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
+  const [dshSessionId, setDshSessionId] = useState<string | null>(null);
   const [probe, setProbe] = useState<Probe | null>(null);
   const [probeFor, setProbeFor] = useState<string | null>(null);
   const [briefInit, setBriefInit] = useState<{ parent?: string | null; name?: string } | null>(null);
@@ -215,6 +217,14 @@ export default function App() {
               </span>
             )}
           </button>
+          <button
+            className={`nav-item ${panel === "aiwrite" ? "active" : ""}`}
+            onClick={() => setPanel("aiwrite")}
+            disabled={!summary}
+          >
+            <span className="nav-icon">🤖</span>
+            <span>AI 写章节</span>
+          </button>
 
           {summary && (
             <div className="section">
@@ -336,6 +346,15 @@ export default function App() {
 
           {summary && panel === "storyboard" && (
             <StoryboardPanel root={summary.root} />
+          )}
+
+          {summary && panel === "aiwrite" && (
+            <AiWritePanel
+              root={summary.root}
+              sessionId={dshSessionId}
+              onSessionId={setDshSessionId}
+              onSaved={() => loadSummary(summary.root)}
+            />
           )}
 
           {summary && panel === "editor" && (

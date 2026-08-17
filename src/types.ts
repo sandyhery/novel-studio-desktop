@@ -189,3 +189,63 @@ export function weightTone(w: ChoiceWeight): "danger" | "warn" | "muted" {
       return "muted";
   }
 }
+
+// ---------------------------------------------------------------------------
+// DSH agent 集成 — AI 写章节
+// ---------------------------------------------------------------------------
+
+export interface AiWriteChapterArgs {
+  root: string;
+  instruction?: string | null;
+  sessionId?: string | null;
+  timeoutSecs?: number;
+  port?: number;
+}
+
+export interface AiWriteChapterResult {
+  ok: boolean;
+  text: string;
+  choiceRequest: {
+    prompt: string;
+    options: Array<{ id: string; label: string; previewHint: string }>;
+  } | null;
+  sessionId: string | null;
+  savedTo: string | null;
+  error: string | null;
+}
+
+export interface AiReconcileBibleArgs {
+  root: string;
+  chapterFile?: string | null;
+  decision?: string | null;
+  sessionId?: string | null;
+  timeoutSecs?: number;
+  port?: number;
+}
+
+export interface AiReconcileBibleResult {
+  ok: boolean;
+  text: string;
+  sessionId: string | null;
+  error: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// 剧情树（Story Spine）
+// ---------------------------------------------------------------------------
+
+export interface SpineNode {
+  kind: "chapter" | "choice" | "branch";
+  id: string;
+  title: string;
+  weight: string | null;
+  decided: string | null;
+  chars: number | null;
+}
+
+export interface StorySpine {
+  ok: boolean;
+  root: string;
+  nodes: SpineNode[];
+  branches: Array<[string, SpineNode[]]>;
+}

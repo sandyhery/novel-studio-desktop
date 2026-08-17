@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   type ChoicePoint,
   type ChoicePointsView,
+  type StorySpine,
   weightLabel,
   weightTone,
 } from "./types";
@@ -13,6 +14,7 @@ interface StoryboardPanelProps {
 
 export default function StoryboardPanel({ root }: StoryboardPanelProps) {
   const [view, setView] = useState<ChoicePointsView | null>(null);
+  const [spine, setSpine] = useState<StorySpine | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
   // 当前正在做决定的抉择点（弹窗态）
@@ -23,8 +25,12 @@ export default function StoryboardPanel({ root }: StoryboardPanelProps) {
   const reload = useCallback(async () => {
     setError(null);
     try {
-      const v = await invoke<ChoicePointsView>("read_choice_points", { root });
+      const [v, sp] = await Promise.all([
+        invoke<ChoicePointsView>("read_choice_points", { root }),
+        invoke<StorySpine>("read_story_spine", { root }).catch(() => null),
+      ]);
       setView(v);
+      setSpine(sp);
     } catch (e) {
       setError(String(e));
       setView(null);
@@ -141,6 +147,10 @@ export default function StoryboardPanel({ root }: StoryboardPanelProps) {
           <div className="metric-hint">需要你或 AI 做出选择</div>
         </div>
       </div>
+
+      {spine && spine.nodes.length > 0 && (
+        <StorySpineView spine={spine} />
+      )}
 
       <h2 className="section-title">待决定（{pending.length}）</h2>
       {pending.length === 0 && (
@@ -315,6 +325,72 @@ function DecideModal(props: {
           </button>
         </footer>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// 剧情树（主线时间轴 + 备选分支）
+// ---------------------------------------------------------------------
+
+function StorySpineView({ spine }: { spine: StorySpine }) {
+  return (
+    <div className="spine">
+      <h2 className="section-title">主线时间轴</h2>
+      <div className="spine-track">
+        {spine.nodes.map((node, i) => (
+          <div key={node.id + i} className="spine-node">
+            {node.kind === "chapter" ? (
+              <div className="spine-chapter">
+                <div className="spine-chapter-dot" />
+                <div className="spine-chapter-label">
+                  <span className="spine-title">{node.title || node.id}</span>
+                  {node.chars != null && (
+                    <span className="muted small">{node.chars} 字</span>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className={`spine-choice weight-${node.weight ?? "major"}`}>
+                <div className="spine-choice-icon">⚖️</div>
+                <div className="spine-choice-body">
+                  <span className="spine-title">{node.title}</span>
+                  <span className="muted small">
+                    {node.weight ? weightLabel(node.weight as any) : "抉择"} ·
+                    {node.decided
+                      ? `已选 ${node.decided}`
+                      : " 待决定"}
+                  </span>
+                </div>
+              </div>
+            )}
+            {i < spine.nodes.length - 1 && <div className="spine-connector">→</div>}
+          </div>
+        ))}
+      </div>
+
+      {spine.branches.some(([, alts]) => alts.length > 0) && (
+        <>
+          <h2 className="section-title" style={{ marginTop: 18 }}>
+            备选分支（未选方向）
+          </h2>
+          <div className="branch-grid">
+            {spine.branches.map(([cpId, alts]) =>
+              alts.length > 0 ? (
+                <div key={cpId} className="branch-card">
+                  <div className="branch-head muted small">{cpId}</div>
+                  {alts.map((b) => (
+                    <div key={b.id} className="branch-item">
+                      <span className="branch-marker">·</span>
+                      <span>{b.title}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null,
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

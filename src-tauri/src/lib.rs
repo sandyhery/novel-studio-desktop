@@ -15,8 +15,15 @@
 //! - read_bible(root, file)       读圣经某文件全文
 //! - read_chapter(root, file)     读章节全文
 //! - write_chapter(root, file, c) 保存章节
+//!
+//! 新增（抉择点 / DSH agent 集成）：
+//! - read_choice_points(root) / decide_choice_point / create_choice_point / seed_demo_choice_points
+//! - ai_write_chapter(root, instruction)  驱动 DSH agent 写一章（含抉择点暂停）
+
+mod dsh_client;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1147,6 +1154,892 @@ fn chrono_like_today_compact() -> String {
     chrono_like_today()
 }
 
+// ===========================================================================
+// 剧情树（Story Spine）— 章节 + 抉择点的结构化视图
+// ===========================================================================
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpineNode {
+    /// "chapter" | "choice" | "branch"
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    pub weight: Option<String>,
+    pub decided: Option<String>,
+    pub chars: Option<u64>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StorySpine {
+    pub ok: bool,
+    pub root: String,
+    /// 主线节点（章节 + 抉择点按序）
+    pub nodes: Vec<SpineNode>,
+    /// 各抉择点下的备选分支（id 到列表）
+    pub branches: Vec<(String, Vec<SpineNode>)>,
+}
+
+/// 读取剧情树：主线 = chapters/*.md + choice-points/cp-*.json 按序合并；
+/// 备选分支 = 每个抉择点的非选中选项。
+#[tauri::command]
+fn read_story_spine(root: String) -> Result<StorySpine, String> {
+    let start = PathBuf::from(&root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+
+    // 章节（已存在的文件）
+    let mut chapters = list_chapters(&novel_root).map_err(err_to_string)?;
+    chapters.sort_by(|a, b| natural_cmp(&a.file, &b.file));
+
+    // 抉择点
+    let (points_dir, _, _, _, _) = ai_novel_paths(&novel_root);
+    let mut points: Vec<ChoicePoint> = Vec::new();
+    if points_dir.is_dir() {
+        if let Ok(rd) = fs::read_dir(&points_dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(text) = fs::read_to_string(&p) {
+                        if let Ok(cp) = serde_json::from_str::<ChoicePoint>(&text) {
+                            points.push(cp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    points.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // 合并为主线：按 after_chapter 把抉择点插到对应章节后
+    let mut nodes: Vec<SpineNode> = Vec::new();
+    for ch in &chapters {
+        nodes.push(SpineNode {
+            kind: "chapter".into(),
+            id: ch.file.clone(),
+            title: ch.title.clone(),
+            weight: None,
+            decided: None,
+            chars: Some(ch.chars),
+        });
+        // 该章节之后的抉择点
+        for cp in &points {
+            if cp.after_chapter == ch.file {
+                nodes.push(SpineNode {
+                    kind: "choice".into(),
+                    id: cp.id.clone(),
+                    title: cp.prompt.clone(),
+                    weight: Some(format!("{:?}", cp.weight).to_ascii_lowercase()),
+                    decided: cp.decided.as_ref().map(|d| d.option_id.clone()),
+                    chars: None,
+                });
+            }
+        }
+    }
+    // 没有任何抉择点明确挂在某章后 → 追加到末尾
+    let known_chapters: Vec<String> = chapters.iter().map(|c| c.file.clone()).collect();
+    for cp in &points {
+        if !known_chapters.contains(&cp.after_chapter) {
+            nodes.push(SpineNode {
+                kind: "choice".into(),
+                id: cp.id.clone(),
+                title: cp.prompt.clone(),
+                weight: Some(format!("{:?}", cp.weight).to_ascii_lowercase()),
+                decided: cp.decided.as_ref().map(|d| d.option_id.clone()),
+                chars: None,
+            });
+        }
+    }
+
+    // 备选分支：每个抉择点的非选中选项作为潜在分支
+    let mut branches: Vec<(String, Vec<SpineNode>)> = Vec::new();
+    for cp in &points {
+        let chosen = cp.decided.as_ref().map(|d| d.option_id.as_str()).unwrap_or("");
+        let alts: Vec<SpineNode> = cp
+            .options
+            .iter()
+            .filter(|o| o.id != chosen)
+            .map(|o| SpineNode {
+                kind: "branch".into(),
+                id: format!("{}/{}", cp.id, o.id),
+                title: o.label.clone(),
+                weight: None,
+                decided: None,
+                chars: None,
+            })
+            .collect();
+        branches.push((cp.id.clone(), alts));
+    }
+
+    Ok(StorySpine {
+        ok: true,
+        root: novel_root.to_string_lossy().to_string(),
+        nodes,
+        branches,
+    })
+}
+
+// ===========================================================================
+// DSH agent 集成 — AI 写章节
+// ===========================================================================
+//
+// 通过 dsh web 的 JSON-RPC over HTTP 驱动 agent：
+//   1. session.create(cwd=小说目录, agentPreset="standard")
+//   2. session.prompt(queue, 写作指令)
+//   3. 轮询 session.history 直到 turn/end
+//   4. 提取 assistant 最终文本
+//
+// 指令协议：我们给 agent 的 system 提示里约定：
+//   - 正常写完一章 → 直接输出章节 markdown 全文
+//   - 遇到关键抉择 → 输出 `@@CHOICE@@ {json} @@END@@` 后停住
+//     抉择 json 形如 { "prompt": "...", "options": [ {id,label,previewHint}, ... ] }
+//
+// ===========================================================================
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiWriteChapterArgs {
+    pub root: String,
+    /// 附加指令（可选）：例如 "写第 3 章，聚焦林楚发现叛徒"。
+    pub instruction: Option<String>,
+    /// 会话 id（可选）：传了就复用，不传每次新建。
+    pub session_id: Option<String>,
+    /// 可选：等待超时（秒），默认 180。
+    pub timeout_secs: Option<u64>,
+    /// 可选：web 端口，默认 3080。
+    pub port: Option<u16>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiWriteChapterResult {
+    pub ok: bool,
+    /// agent 最终输出的完整文本（可能包含 @@CHOICE@@ 标记）
+    pub text: String,
+    /// 若 agent 要求抉择，这里是非 None 的抉择 JSON
+    pub choice_request: Option<Value>,
+    /// 用于续写的会话 id（保持上下文）
+    pub session_id: Option<String>,
+    /// 是否已把文本写入 chapters/<file>
+    pub saved_to: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 构建给 agent 的写作指令（把小说项目上下文 + 用户指令拼一起）。
+fn build_writing_prompt(root: &Path, instruction: &str) -> Result<String, String> {
+    let state_text = fs::read_to_string(root.join("state.yml")).unwrap_or_default();
+    let bible_dir = root.join("bible");
+    let mut bible_summary = String::new();
+    if let Ok(entries) = fs::read_dir(&bible_dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".md") {
+                let p = e.path();
+                if let Ok(text) = fs::read_to_string(&p) {
+                    let head: String = text.chars().take(600).collect();
+                    bible_summary.push_str(&format!("\n### {name}\n{head}\n"));
+                }
+            }
+            if e.path().is_dir() && name == "characters" {
+                if let Ok(chars) = fs::read_dir(e.path()) {
+                    for c in chars.flatten() {
+                        let cname = c.file_name().to_string_lossy().to_string();
+                        if cname.ends_with(".md") {
+                            if let Ok(text) = fs::read_to_string(c.path()) {
+                                let head: String = text.chars().take(300).collect();
+                                bible_summary.push_str(&format!("\n#### 角色 {cname}\n{head}\n"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let chapters_dir = root.join("chapters");
+    let mut chapter_list = String::new();
+    if let Ok(entries) = fs::read_dir(&chapters_dir) {
+        let mut files: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|f| f.ends_with(".md"))
+            .collect();
+        files.sort();
+        for f in files {
+            chapter_list.push_str(&format!("- {f}\n"));
+        }
+    }
+
+    Ok(format!(
+        "你是一位小说家，正在为小说《{title}》创作。\n\
+         工作目录：{cwd}\n\n\
+         ## 项目状态（state.yml）\n\
+         ```\n{state}\n```\n\n\
+         ## 世界圣经摘要（bible/）\n\
+         {bible}\n\n\
+         ## 已有章节列表\n\
+         {chapters}\n\n\
+         ## 你的任务\n\
+         {instruction}\n\n\
+         ## 输出规则（重要）\n\
+         - 直接输出新章节的 markdown 全文（以 # 开头的一级标题作为章节名）。\n\
+         - 不要修改任何 bible/ 文件、不要创建额外文件。\n\
+         - 如果写作过程中遇到【影响主线方向的抉择点】——角色生死、阵营归属、重大立场选择等——\n\
+           不要自己决定，也不要继续往下写；停止并输出下面这个固定格式：\n\
+           \n\
+           @@CHOICE@@ {{\"prompt\": \"<把抉择用一句话写清楚>\", \"options\": [{{\"id\": \"a\", \"label\": \"<选项A>\", \"previewHint\": \"<选了A之后1-2句走向预览>\"}}, {{\"id\": \"b\", \"label\": \"<选项B>\", \"previewHint\": \"<选了B之后1-2句走向预览>\"}}, {{\"id\": \"c\", \"label\": \"<选项C>\", \"previewHint\": \"<选了C之后1-2句走向预览>\"}}, {{\"id\": \"ai\", \"label\": \"让 AI 决定\", \"previewHint\": \"AI 评估剧情张力后选择\"}}]}} @@END@@\n\
+           \n\
+           - 抉择的权重分级：critical（重大转折）永远停；major（重要支线）永远停；\n\
+             minor（小决定）可以自己定，但如果你拿不准也可以停下来问。\n\
+           - 一旦决定继续，从上一个抉择点接续写作，不要重复已写内容。",
+        title = read_state(root).title,
+        cwd = root.display(),
+        state = state_text,
+        bible = bible_summary,
+        chapters = chapter_list,
+        instruction = instruction,
+    ))
+}
+
+/// 驱动 DSH agent 写一章。阻塞直到 agent 回合结束（或超时）。
+#[tauri::command]
+fn ai_write_chapter(args: AiWriteChapterArgs) -> Result<AiWriteChapterResult, String> {
+    use dsh_client as dsh;
+
+    let start = PathBuf::from(&args.root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let port = args.port.unwrap_or(dsh::default_port());
+    let timeout = args.timeout_secs.unwrap_or(180);
+
+    if !dsh::ping(port) {
+        return Ok(AiWriteChapterResult {
+            ok: false,
+            error: Some(format!(
+                "DSH Web 服务未运行（127.0.0.1:{port}）。请先在 dsh-cockpit 的 🖥️ Web UI 面板里启动，或运行 `dsh web`。"
+            )),
+            ..Default::default()
+        });
+    }
+
+    let instruction = args.instruction.unwrap_or_else(|| {
+        let state = read_state(&novel_root);
+        let next = state.current_chapter;
+        format!("写第 {next} 章（ch{next}.md）。基于 state.yml 的当前进度与圣经，写出一章约 2000-3500 字、剧情推进、结尾留钩子的正文。")
+    });
+    let prompt = build_writing_prompt(&novel_root, &instruction).map_err(|e| e.to_string())?;
+
+    // 1. create session
+    let sid = dsh::session_create(
+        &novel_root.to_string_lossy(),
+        args.session_id.as_deref(),
+        Some("standard"),
+        port,
+    )
+    .map_err(|e| format!("创建 DSH 会话失败：{e}"))?;
+
+    // 2. prompt
+    dsh::session_prompt(&sid, &prompt, "queue", port).map_err(|e| format!("提交指令失败：{e}"))?;
+
+    // 3. wait
+    let outcome = dsh::wait_for_assistant(&sid, port, timeout).map_err(|e| e.to_string())?;
+
+    let mut result = AiWriteChapterResult {
+        ok: true,
+        text: outcome.text.clone(),
+        choice_request: outcome.choice_request.clone(),
+        session_id: Some(sid),
+        saved_to: None,
+        error: None,
+    };
+
+    // 4. 如果没有抉择点，尝试把章节写入 chapters/ch{N}.md（自动命名）
+    if outcome.choice_request.is_none() && !outcome.text.trim().is_empty() {
+        let cleaned = extract_markdown_body(&outcome.text);
+        // 从正文标题推断章号（# 第一章 → 1；# 第三章 → 3；找不到用 current_chapter）
+        let inferred = infer_chapter_number(&cleaned);
+        let state = read_state(&novel_root);
+        let next_num: u32 = if let Some(n) = inferred {
+            n
+        } else {
+            state.current_chapter.trim().parse::<u32>().unwrap_or(0)
+        };
+        let file = format!("ch{:03}.md", next_num);
+        let target = novel_root.join("chapters").join(&file);
+        // 已存在则找下一个空位（防止覆盖）
+        let file = if target.exists() {
+            let mut n = next_num + 1;
+            loop {
+                let candidate = format!("ch{:03}.md", n);
+                if !novel_root.join("chapters").join(&candidate).exists() {
+                    break candidate;
+                }
+                n += 1;
+            }
+        } else {
+            file
+        };
+        let target = novel_root.join("chapters").join(&file);
+        if fs::write(&target, cleaned.as_bytes()).is_ok() {
+            result.saved_to = Some(file);
+            // 更新 state.yml 的 current_chapter
+            let next = next_num + 1;
+            let updated = update_state_current_chapter(&novel_root, next);
+            let _ = updated;
+        }
+    }
+
+    Ok(result)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReconcileBibleArgs {
+    pub root: String,
+    /// 章节文件名（如 ch001.md），可选
+    pub chapter_file: Option<String>,
+    /// 用户刚做的决定（可选）："{point}: 决定选 X —— 备注"
+    pub decision: Option<String>,
+    pub session_id: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub port: Option<u16>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReconcileBibleResult {
+    pub ok: bool,
+    pub text: String,
+    pub session_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 让 AI 读完最近一章 + 现有 bible，自动更新：
+///   - bible/timeline.md（追加章节锚点）
+///   - bible/foreshadowing.md（登记新伏笔 / 销账已收）
+///   - 涉及的角色档案（本章变化记录）
+///   - state.yml（foreshadowing_open 等）
+/// 这是"每章收尾三件事"的 AI 机械化版本。
+#[tauri::command]
+fn ai_reconcile_bible(args: AiReconcileBibleArgs) -> Result<AiReconcileBibleResult, String> {
+    use dsh_client as dsh;
+
+    let start = PathBuf::from(&args.root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let port = args.port.unwrap_or(dsh::default_port());
+    let timeout = args.timeout_secs.unwrap_or(180);
+
+    if !dsh::ping(port) {
+        return Ok(AiReconcileBibleResult {
+            ok: false,
+            error: Some(format!("DSH Web 服务未运行（127.0.0.1:{port}）。请先启动 dsh web。")),
+            ..Default::default()
+        });
+    }
+
+    // 读取最近一章内容
+    let chapter_text = if let Some(file) = &args.chapter_file {
+        fs::read_to_string(novel_root.join("chapters").join(file))
+            .unwrap_or_default()
+    } else {
+        // 找 chapters/ 里最后一个
+        let mut files: Vec<String> = fs::read_dir(novel_root.join("chapters"))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|f| f.ends_with(".md"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        if let Some(last) = files.pop() {
+            fs::read_to_string(novel_root.join("chapters").join(&last)).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+
+    let timeline = fs::read_to_string(novel_root.join("bible").join("timeline.md")).unwrap_or_default();
+    let foreshadowing = fs::read_to_string(novel_root.join("bible").join("foreshadowing.md")).unwrap_or_default();
+    let decision_note = args.decision.clone().unwrap_or_default();
+
+    let prompt = format!(
+        "你是小说连续性守门员。读下面的章节正文与现有 bible 摘录，产出【收尾三件事】的**结构化增量**。\n\
+         \n\
+         ## 必须遵守\n\
+         - 只输出一个 JSON 对象，不要输出任何其他文字、不要 markdown 代码块围栏。\n\
+         - 不要重写整个文件 —— 只给「追加/替换」的最小增量。\n\
+         - 绝对不要输出章节正文或小说草稿。\n\
+         \n\
+         ## 输出格式（严格 JSON）\n\
+         {{\n\
+           \"timelineRows\": [ \"| ch1 | 世界历 47 年秋 | 17 | 王城 | 李四捡到怀表 | 李四 |\" ],\n\
+           \"foreshadowingRows\": [ \"| F001 | ch1 | 怀表停在3:47 | 杂货铺 | 埋设 | —\" ],\n\
+           \"foreshadowingResolve\": [ {{ \"id\": \"F001\", \"chapter\": \"ch1\", \"way\": \"如何回收\" }} ],\n\
+           \"characterUpdates\": [ {{\"file\": \"characters/李四\", \"note\": \"捡到怀表，开始怀疑时间\" }} ]\n\
+         }}\n\
+         - timelineRows：追加到 timeline.md「章节锚点」表（在（追加）占位行前）\n\
+         - foreshadowingRows：追加到 foreshadowing.md 表格（在（追加）行前）\n\
+         - foreshadowingResolve：把对应 ID 的状态从「待收」改为「已收（chN）」\n\
+         - characterUpdates：在角色档案的「本章变化记录」追加一行\n\
+         - 没有的数组留空 []\n\
+         \n\
+         ## 用户刚做的决定（若有，影响剧情）\n\
+         {decision}\n\
+         \n\
+         ## 章节正文（最近一章）\n\
+         ```markdown\n{chapter}\n```\n\
+         \n\
+         ## 现有 timeline.md（只摘录表格部分）\n\
+         ```\n{timeline}\n```\n\
+         \n\
+         ## 现有 foreshadowing.md\n\
+         ```\n{foreshadowing}\n```",
+        decision = decision_note,
+        chapter = if chapter_text.chars().count() > 3500 {
+            chapter_text.chars().take(3500).collect::<String>()
+        } else {
+            chapter_text.clone()
+        },
+        timeline = if timeline.chars().count() > 2000 { timeline.chars().take(2000).collect::<String>() } else { timeline },
+        foreshadowing = if foreshadowing.chars().count() > 2000 { foreshadowing.chars().take(2000).collect::<String>() } else { foreshadowing },
+    );
+
+    let sid = dsh::session_create(
+        &novel_root.to_string_lossy(),
+        args.session_id.as_deref(),
+        Some("standard"),
+        port,
+    )
+    .map_err(|e| format!("创建 DSH 会话失败：{e}"))?;
+
+    dsh::session_prompt(&sid, &prompt, "queue", port).map_err(|e| format!("提交指令失败：{e}"))?;
+    let outcome = dsh::wait_for_assistant(&sid, port, timeout).map_err(|e| e.to_string())?;
+    let text = outcome.text.clone();
+
+    // 解析 JSON（容忍被 ```json 围栏包裹）
+    let json_str = extract_json_object(&text);
+    let delta: Value = match json_str.as_deref().and_then(|s| serde_json::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            return Ok(AiReconcileBibleResult {
+                ok: false,
+                text,
+                session_id: Some(sid),
+                error: Some("agent 没有输出合法 JSON 增量（reconcile 失败）".into()),
+            });
+        }
+    };
+
+    // 应用 delta 到 bible 文件
+    let mut applied = 0usize;
+    let bible_dir = novel_root.join("bible");
+
+    // timeline rows
+    if let Some(rows) = delta.get("timelineRows").and_then(|r| r.as_array()) {
+        if !rows.is_empty() {
+            let tl_path = bible_dir.join("timeline.md");
+            if let Ok(existing) = fs::read_to_string(&tl_path) {
+                let rows_text: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.as_str().map(|s| s.to_string()))
+                    .collect();
+                let updated = insert_rows_before_append(&existing, &rows_text);
+                if fs::write(&tl_path, updated.as_bytes()).is_ok() {
+                    applied += rows.len();
+                }
+            }
+        }
+    }
+
+    // foreshadowing rows
+    if let Some(rows) = delta.get("foreshadowingRows").and_then(|r| r.as_array()) {
+        if !rows.is_empty() {
+            let fs_path = bible_dir.join("foreshadowing.md");
+            if let Ok(existing) = fs::read_to_string(&fs_path) {
+                let rows_text: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.as_str().map(|s| s.to_string()))
+                    .collect();
+                let updated = insert_rows_before_append(&existing, &rows_text);
+                if fs::write(&fs_path, updated.as_bytes()).is_ok() {
+                    applied += rows.len();
+                }
+            }
+        }
+    }
+
+    // foreshadowing resolve（状态列：待收 → 已收(chN)）
+    if let Some(resolves) = delta.get("foreshadowingResolve").and_then(|r| r.as_array()) {
+        for res in resolves {
+            let id = res.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let ch = res.get("chapter").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() || ch.is_empty() {
+                continue;
+            }
+            let fs_path = bible_dir.join("foreshadowing.md");
+            if let Ok(existing) = fs::read_to_string(&fs_path) {
+                let updated = resolve_foreshadow_row(&existing, id, ch);
+                if fs::write(&fs_path, updated.as_bytes()).is_ok() {
+                    applied += 1;
+                }
+            }
+        }
+    }
+
+    // character updates
+    if let Some(updates) = delta.get("characterUpdates").and_then(|r| r.as_array()) {
+        for upd in updates {
+            let file = upd.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let note = upd.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            if file.is_empty() || note.is_empty() {
+                continue;
+            }
+            let char_path = if file.starts_with("characters/") {
+                bible_dir.join(format!("{file}.md"))
+            } else {
+                bible_dir.join("characters").join(format!("{file}.md"))
+            };
+            if let Ok(existing) = fs::read_to_string(&char_path) {
+                let updated = append_character_change_note(&existing, note);
+                if fs::write(&char_path, updated.as_bytes()).is_ok() {
+                    applied += 1;
+                }
+            }
+        }
+    }
+
+    Ok(AiReconcileBibleResult {
+        ok: true,
+        text,
+        session_id: Some(sid),
+        error: if applied == 0 { Some("delta 为空或全部未应用".into()) } else { None },
+    })
+}
+
+/// 从文本里提取第一个 JSON 对象（容忍 ```json 围栏和前后说明文字）。
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    // 找匹配的右花括号（简单计数，忽略字符串内 {} —— 够用）
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, c) in text[start..].char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..start + i + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 在表格的「（追加）」占位行前插入若干行。
+fn insert_rows_before_append(existing: &str, rows: &[String]) -> String {
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    let mut insert_at: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("（追加）") || line.contains("(追加)") {
+            insert_at = Some(i);
+            break;
+        }
+    }
+    match insert_at {
+        Some(idx) => {
+            let mut out = Vec::with_capacity(lines.len() + rows.len());
+            out.extend_from_slice(&lines[..idx]);
+            for r in rows {
+                out.push(r.clone());
+            }
+            out.extend_from_slice(&lines[idx..]);
+            out.join("\n")
+        }
+        None => {
+            let mut out = existing.trim_end().to_string();
+            for r in rows {
+                out.push('\n');
+                out.push_str(r);
+            }
+            out.push('\n');
+            out
+        }
+    }
+}
+
+/// 把 foreshadowing.md 里某行的「待收」改为「已收（chN）」。
+fn resolve_foreshadow_row(existing: &str, id: &str, chapter: &str) -> String {
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    for line in lines.iter_mut() {
+        if line.trim_start().starts_with('|') && line.contains(id) {
+            // 找「状态」列：| ID | 埋设章节 | 物件 | 埋点 | 状态 | 回收方式 |
+            let parts: Vec<&str> = line.split('|').map(|p| p.trim()).collect();
+            if parts.len() >= 7 && parts[5] == "待收" {
+                // 重建：| a | b | c | d | 已收（chN） | 见本章正文 |
+                let mut body: Vec<String> = Vec::with_capacity(6);
+                for (i, p) in parts.iter().enumerate().skip(1).take(6) {
+                    let cell = match i {
+                        5 => format!("已收（{chapter}）"),
+                        6 if p.is_empty() || *p == "—" => "见本章正文".to_string(),
+                        _ => p.to_string(),
+                    };
+                    body.push(cell);
+                }
+                *line = format!("| {} |", body.join(" | "));
+                break;
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// 在角色档案的「本章变化记录」段追加一行。
+fn append_character_change_note(existing: &str, note: &str) -> String {
+    // 找「## 当前状态」下的「- 本章变化记录（N 章：…）」行，或文件末尾追加
+    if let Some(pos) = existing.find("本章变化记录") {
+        // 在该行后追加新一行
+        let line_end = existing[pos..].find('\n').map(|i| pos + i).unwrap_or(existing.len());
+        let mut out = existing.to_string();
+        out.insert_str(line_end + 1, &format!("- 本章变化记录（续）：{note}\n"));
+        out
+    } else {
+        let mut out = existing.trim_end().to_string();
+        out.push_str(&format!("\n\n## 当前状态（追加）\n- 本章变化记录：{note}\n"));
+        out
+    }
+}
+
+/// 解析 `### FILE: <path>\n<content>\n### END` 块
+fn split_file_blocks(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut buf = String::new();
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("### FILE:") {
+            // 新块开始
+            if let (Some(p), content) = (current_path.take(), std::mem::take(&mut buf)) {
+                out.push((p, content));
+            }
+            current_path = Some(path.trim().to_string());
+            buf = String::new();
+        } else if line.trim() == "### END" {
+            if let (Some(p), content) = (current_path.take(), std::mem::take(&mut buf)) {
+                out.push((p, content));
+            }
+        } else {
+            if current_path.is_some() {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+    }
+    // flush
+    if let (Some(p), content) = (current_path.take(), std::mem::take(&mut buf)) {
+        out.push((p, content));
+    }
+    out
+}
+fn infer_chapter_number(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        let t = line.trim_start_matches('#').trim();
+        if t.is_empty() {
+            continue;
+        }
+        // 匹配 "第一章" / "第 3 章" / "第十二章" / "ch1"
+        if let Some(rest) = t.strip_prefix("第") {
+            // 取到 "章" 之前的部分
+            let part: String = rest.chars().take_while(|c| *c != '章').collect();
+            let part = part.trim();
+            if let Some(n) = parse_cn_num(part) {
+                return Some(n);
+            }
+            // 数字形式 "第 12 章"
+            let digits: String = part.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                return Some(n);
+            }
+        }
+        // "ch1" / "ch01" / "ch001"
+        let lower = t.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("ch") {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                return Some(n);
+            }
+        }
+        return None; // 第一个非空标题行没有章号 → 不推断
+    }
+    None
+}
+
+/// 解析中文数字（一到九十九；百/千 支持到 9999）。
+fn parse_cn_num(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 纯阿拉伯数字
+    if let Ok(n) = s.parse::<u32>() {
+        return Some(n);
+    }
+    let digit = |c: char| -> Option<u32> {
+        match c {
+            '零' | '〇' => Some(0),
+            '一' | '壹' => Some(1),
+            '二' | '两' | '贰' => Some(2),
+            '三' | '叁' => Some(3),
+            '四' | '肆' => Some(4),
+            '五' | '伍' => Some(5),
+            '六' | '陆' => Some(6),
+            '七' | '柒' => Some(7),
+            '八' | '捌' => Some(8),
+            '九' | '玖' => Some(9),
+            _ => return None,
+        }
+        .into()
+    };
+    // 简单处理：十/百/千
+    let mut total: u32 = 0;
+    let mut current: u32 = 0;
+    let mut last_digit: Option<u32> = None;
+    for c in s.chars() {
+        match c {
+            '十' => {
+                let base = if current == 0 { 1 } else { current };
+                total += base * 10;
+                current = 0;
+                last_digit = None;
+            }
+            '百' => {
+                let base = if current == 0 { 1 } else { current };
+                total += base * 100;
+                current = 0;
+                last_digit = None;
+            }
+            '千' => {
+                let base = if current == 0 { 1 } else { current };
+                total += base * 1000;
+                current = 0;
+                last_digit = None;
+            }
+            _ => {
+                if let Some(d) = digit(c) {
+                    current = d;
+                    last_digit = Some(d);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    if let Some(d) = last_digit {
+        total += d;
+    }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// 更新 state.yml 的 current_chapter（简单行替换）。
+fn update_state_current_chapter(root: &Path, next: u32) -> Result<(), String> {
+    let path = root.join("state.yml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("read state.yml: {e}"))?;
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut replaced = false;
+    for line in lines.iter_mut() {
+        let t = line.trim();
+        if t.starts_with("current_chapter:") {
+            let indent = line
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect::<String>();
+            *line = format!("{indent}current_chapter: {next}");
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.push(format!("current_chapter: {next}"));
+    }
+    fs::write(&path, lines.join("\n").as_bytes())
+        .map_err(|e| format!("write state.yml: {e}"))
+}
+
+/// 去掉输出里的 @@CHOICE@@ 标记（如果混在文本里），保留正文。
+fn strip_choice_markers(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_choice = false;
+    let mut rest = text;
+    loop {
+        let start = rest.find("@@CHOICE@@");
+        match start {
+            Some(idx) => {
+                out.push_str(&rest[..idx]);
+                let after = &rest[idx + "@@CHOICE@@".len()..];
+                match after.find("@@END@@") {
+                    Some(end) => {
+                        rest = &after[end + "@@END@@".len()..];
+                    }
+                    None => {
+                        in_choice = true;
+                        break;
+                    }
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    if in_choice {
+        // 文本末尾还有未闭合的 CHOICE —— 截断到标记前
+        // （这种情况不该发生，防御性处理）
+    }
+    out.trim().to_string()
+}
+
+/// 提取章节 markdown 正文：跳过 agent 的"说明文字"，从第一个 `# ` 标题开始。
+/// 若找不到标题，原样返回。
+fn extract_markdown_body(text: &str) -> String {
+    let stripped = strip_choice_markers(text);
+    let mut lines = stripped.lines();
+    // 跳过正文前的说明文字（直到第一个以 # 开头的一级/多级标题行）
+    for (i, line) in stripped.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ") {
+            return stripped
+                .lines()
+                .skip(i)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+        }
+        let _ = lines.next();
+    }
+    stripped
+}
+
 // ---------------------------------------------------------------------------
 // entry
 // ---------------------------------------------------------------------------
@@ -1166,7 +2059,10 @@ pub fn run() {
             read_choice_points,
             decide_choice_point,
             create_choice_point,
-            seed_demo_choice_points
+            seed_demo_choice_points,
+            ai_write_chapter,
+            ai_reconcile_bible,
+            read_story_spine
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1179,6 +2075,13 @@ mod tests {
 
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// 串行化所有访问真实用户目录的测试（避免并行时 .ai-novel 互踩）。
+    static REAL_DIR_LOCK: Mutex<()> = Mutex::new(());
+    fn lock_real_dir() -> std::sync::MutexGuard<'static, ()> {
+        REAL_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn probe_missing_path() {
@@ -1351,6 +2254,7 @@ mod tests {
     /// 不依赖 GUI；直接调私有命令函数。
     #[test]
     fn smoke_choice_points_on_real_user_dir() {
+        let _guard = lock_real_dir();
         let p = "/Users/zhouluyong/Documents/我的小说";
         let path = std::path::Path::new(p);
         if !path.join("state.yml").exists() || !path.join("bible").is_dir() {
@@ -1395,5 +2299,136 @@ mod tests {
         // 清理 smoke 数据（让用户从 UI 真正走一遍时是干净的）
         let _ = fs::remove_dir_all(path.join(".ai-novel"));
         eprintln!("(清理 .ai-novel smoke 用例数据)");
+    }
+
+    /// 端到端：真实驱动 DSH agent 写一章（需要 dsh web 在 3080 跑着）。
+    /// 默认 #[ignore]，手动跑：cargo test e2e_ai_write_chapter -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_ai_write_chapter() {
+        let p = "/Users/zhouluyong/Documents/我的小说";
+        let path = std::path::Path::new(p);
+        if !path.join("state.yml").exists() || !path.join("bible").is_dir() {
+            eprintln!("skipped — 项目根未就绪");
+            return;
+        }
+        let result = ai_write_chapter(AiWriteChapterArgs {
+            root: p.to_string(),
+            instruction: Some("写第一章（ch001.md），大约 600-1000 字即可（测试用短章）。主角登场，结尾留一个钩子。".to_string()),
+            session_id: None,
+            timeout_secs: Some(240),
+            port: Some(3080),
+        })
+        .expect("ai_write_chapter call");
+
+        eprintln!("ok={} saved_to={:?} session={:?}", result.ok, result.saved_to, result.session_id);
+        eprintln!("choice_request={:?}", result.choice_request.as_ref().map(|c| c.get("prompt")));
+        eprintln!("text_len={}", result.text.chars().count());
+        eprintln!("text_head: {}", result.text.chars().take(200).collect::<String>());
+
+        // 若保存了章节，回读验证
+        if let Some(file) = result.saved_to {
+            let fp = path.join("chapters").join(&file);
+            let content = fs::read_to_string(&fp).unwrap_or_default();
+            assert!(!content.trim().is_empty(), "保存的章节不应为空");
+            eprintln!("✓ 已保存章节 {file}（{} 字）", content.chars().count());
+        }
+    }
+
+    #[test]
+    fn infer_chapter_number_variants() {
+        assert_eq!(infer_chapter_number("# 第一章 停在三点四十七"), Some(1));
+        assert_eq!(infer_chapter_number("# 第十二章 重逢"), Some(12));
+        assert_eq!(infer_chapter_number("# 第 3 章 迷雾"), Some(3));
+        assert_eq!(infer_chapter_number("# ch5 后记"), Some(5));
+        assert_eq!(infer_chapter_number("## 序章"), None); // 序章不是数字
+        assert_eq!(infer_chapter_number("随便一段文字没有标题"), None);
+    }
+
+    #[test]
+    fn parse_cn_num_variants() {
+        assert_eq!(parse_cn_num("一"), Some(1));
+        assert_eq!(parse_cn_num("十二"), Some(12));
+        assert_eq!(parse_cn_num("二十"), Some(20));
+        assert_eq!(parse_cn_num("二十一"), Some(21));
+        assert_eq!(parse_cn_num("百"), Some(100));
+        assert_eq!(parse_cn_num("三百"), Some(300));
+        assert_eq!(parse_cn_num("三十二"), Some(32));
+    }
+
+    #[test]
+    fn extract_markdown_body_drops_preamble() {
+        let text = "第一章已写好并保存。\n\n按任务要求没有修改文件。\n\n---\n\n# 第一章 怀表\n\n正文开始了。";
+        let body = extract_markdown_body(text);
+        assert!(body.starts_with("# 第一章 怀表"), "body={body}");
+        assert!(!body.contains("已写好"), "不应含说明文字");
+        assert!(body.contains("正文开始了"));
+    }
+
+    #[test]
+    fn split_file_blocks_parses_marker_blocks() {
+        let text = "先说一下。\n\n### FILE: bible/timeline.md\n| ch1 | 世界历 47 年秋 | 17 | 王城 | 李四捡到怀表 | 李四 |\n### END\n\n### FILE: bible/foreshadowing.md\n(unchanged)\n### END";
+        let blocks = split_file_blocks(text);
+        assert_eq!(blocks.len(), 2, "blocks={blocks:?}");
+        assert_eq!(blocks[0].0, "bible/timeline.md");
+        assert!(blocks[0].1.contains("李四捡到怀表"));
+        assert_eq!(blocks[1].0, "bible/foreshadowing.md");
+        assert_eq!(blocks[1].1.trim(), "(unchanged)");
+    }
+
+    /// 端到端：read_story_spine 真实项目。无需 dsh web。
+    #[test]
+    fn e2e_read_story_spine_real_dir() {
+        let _guard = lock_real_dir();
+        let p = "/Users/zhouluyong/Documents/我的小说";
+        let path = std::path::Path::new(p);
+        if !path.join("state.yml").exists() || !path.join("bible").is_dir() {
+            eprintln!("skipped — 项目根未就绪");
+            return;
+        }
+        // 确保有抉择点数据（seed 若没有）
+        let _ = seed_demo_choice_points(p.to_string()).expect("seed");
+        let spine = read_story_spine(p.to_string()).expect("read spine");
+        eprintln!("nodes: {}", spine.nodes.len());
+        for n in &spine.nodes {
+            eprintln!("  [{}] {} {}", n.kind, n.id, n.title.chars().take(30).collect::<String>());
+        }
+        assert!(!spine.nodes.is_empty());
+        // 清理 seed（保持目录干净）
+        let _ = fs::remove_dir_all(path.join(".ai-novel"));
+        eprintln!("(清理 .ai-novel)");
+    }
+
+    /// 端到端：AI 收尾三件事（同步圣经）。需要 dsh web。默认 #[ignore]。
+    #[test]
+    #[ignore]
+    fn e2e_ai_reconcile_bible() {
+        let p = "/Users/zhouluyong/Documents/我的小说";
+        let path = std::path::Path::new(p);
+        if !path.join("state.yml").exists() || !path.join("bible").is_dir() {
+            eprintln!("skipped — 项目根未就绪");
+            return;
+        }
+        // 备份 timeline/foreshadowing（防止真改坏）
+        let tl_bak = fs::read_to_string(path.join("bible").join("timeline.md")).unwrap_or_default();
+        let fs_bak = fs::read_to_string(path.join("bible").join("foreshadowing.md")).unwrap_or_default();
+
+        let res = ai_reconcile_bible(AiReconcileBibleArgs {
+            root: p.to_string(),
+            chapter_file: Some("ch001.md".to_string()),
+            decision: Some("cp-001: 人类决定选 b（流放萧承）".to_string()),
+            session_id: None,
+            timeout_secs: Some(240),
+            port: Some(3080),
+        })
+        .expect("reconcile call");
+
+        eprintln!("ok={} error={:?} text_len={}", res.ok, res.error, res.text.chars().count());
+        eprintln!("text_head: {}", res.text.chars().take(300).collect::<String>());
+
+        // 恢复备份
+        fs::write(path.join("bible").join("timeline.md"), tl_bak.as_bytes()).unwrap();
+        fs::write(path.join("bible").join("foreshadowing.md"), fs_bak.as_bytes()).unwrap();
+        eprintln!("(已恢复 timeline/foreshadowing 备份)");
     }
 }
