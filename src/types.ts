@@ -123,3 +123,69 @@ export type Probe =
   | { kind: "nonEmptyDir"; path: string; parent: string; suggestedName: string; sample: string[] }
   | { kind: "novelSubdir"; path: string; parent: string; suggestedName: string; root: string }
   | { kind: "novelRoot"; path: string; parent: string; suggestedName: string };
+
+// ---------------------------------------------------------------------------
+// 抉择点 / 剧情分支
+// ---------------------------------------------------------------------------
+
+export type ChoiceWeight = "critical" | "major" | "minor" | "flavor";
+
+export interface ChoiceOption {
+  id: string;
+  label: string;
+  previewHint: string; // 1-2 句"如果选 X 接下来会怎样"
+}
+
+export interface DecisionRecord {
+  by: "human" | "ai";
+  optionId: string;
+  decidedAt: string; // ISO 8601
+  note: string | null;
+}
+
+export interface ChoicePoint {
+  id: string;
+  weight: ChoiceWeight;
+  afterChapter: string;
+  prompt: string;
+  options: ChoiceOption[];
+  decided: DecisionRecord | null;
+}
+
+export interface ChoicePointsView {
+  root: string;
+  aiNovelDirExists: boolean;
+  points: ChoicePoint[];
+  decidedCount: number;
+  pendingCount: number;
+}
+
+/** 决定一个抉择点用的 args（与 Rust 端的 DecideChoiceArgs 对应）。 */
+export interface DecideChoiceArgs {
+  root: string;
+  pointId: string;
+  optionId: string;
+  by: "human" | "ai";
+  note?: string | null;
+}
+
+/** 一个 weight 的中文副本 */
+export function weightLabel(w: ChoiceWeight): string {
+  switch (w) {
+    case "critical": return "重大转折";
+    case "major": return "重要选择";
+    case "minor": return "小决定";
+    case "flavor": return "调味";
+  }
+}
+
+/** weight 对应配色：使用现有的 danger/warn 之类 */
+export function weightTone(w: ChoiceWeight): "danger" | "warn" | "muted" {
+  switch (w) {
+    case "critical": return "danger";
+    case "major": return "warn";
+    case "minor":
+    case "flavor":
+      return "muted";
+  }
+}

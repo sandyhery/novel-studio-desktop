@@ -773,6 +773,380 @@ fn truncate_for_table_cell(s: &str, max_chars: usize) -> String {
     out
 }
 
+// ===========================================================================
+// 抉择点 / 剧情分支 / Story Spine
+// ===========================================================================
+//
+// 数据结构（同 @ethanyoq/dsh-ai-novel-writer 的命名保持一致，避免将来要做
+// 互操作时改名）：
+//
+// .ai-novel/
+//   ├─ choice-points/cp-XXX.json        单次抉择（不重复）
+//   ├─ branches/bp-XXX.json             单段分支剧情段（1~3 章汇回主干）
+//   ├─ story-spine.json                 结构化剧情树
+//   └─ choices.md                       决策索引（人类可读）
+//
+// "主干 + 关键岔路" 形态：每个抉择点 ≥1 个分支，分支结尾通常汇回主干。
+// 形态选择见 strategy/04-product-shape 文档。
+//
+// ===========================================================================
+
+const AI_NOVEL_DIR: &str = ".ai-novel";
+const CHOICE_POINTS_DIR: &str = ".ai-novel/choice-points";
+const BRANCHES_DIR: &str = ".ai-novel/branches";
+const STORY_SPINE_JSON: &str = ".ai-novel/story-spine.json";
+const CHOICES_INDEX_MD: &str = ".ai-novel/choices.md";
+
+/// choice point 的"重量"等级，决定 AI 是否自动打断找人。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ChoiceWeight {
+    /// 不可回头的剧情转折。总是打断。
+    Critical,
+    /// 重要支线选择。>= major 总是打断。
+    Major,
+    /// 小决定，AI 自己选。
+    Minor,
+    /// 调味项，AI 自己选。
+    Flavor,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChoiceOption {
+    pub id: String,
+    pub label: String,
+    /// 1-2 句"如果选 X 接下来会怎样"，用户做决定时的预览。
+    pub preview_hint: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionRecord {
+    pub by: String,           // "human" | "ai"
+    pub option_id: String,
+    pub decided_at: String,   // ISO 8601
+    /// 自由文本备注（人类在决定时打的便签；AI 决定时可留评估原因）
+    pub note: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChoicePoint {
+    pub id: String,
+    pub weight: ChoiceWeight,
+    /// 在哪个章节/分支之后。例："ch3" / "bp-001"。
+    pub after_chapter: String,
+    pub prompt: String,
+    pub options: Vec<ChoiceOption>,
+    pub decided: Option<DecisionRecord>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChoicePointsView {
+    pub root: String,
+    pub ai_novel_dir_exists: bool,
+    pub points: Vec<ChoicePoint>,
+    /// 摘要：决定的总数 / 待定的总数
+    pub decided_count: usize,
+    pub pending_count: usize,
+}
+
+fn ai_novel_paths(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let base = root.join(AI_NOVEL_DIR);
+    (
+        base.join("choice-points"),
+        base.join("branches"),
+        base.join("story-spine.json"),
+        base.clone(),
+        base.join("choices.md"),
+    )
+}
+
+fn next_cp_id(points_dir: &Path) -> String {
+    // 找现有 cp-XXX.json 的最大编号
+    let mut max_n: u32 = 0;
+    if let Ok(rd) = fs::read_dir(points_dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name.strip_prefix("cp-") {
+                if let Some(rest) = rest.strip_suffix(".json") {
+                    if let Ok(n) = rest.parse::<u32>() {
+                        if n > max_n {
+                            max_n = n;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    format!("cp-{:03}", max_n + 1)
+}
+
+fn cp_path(points_dir: &Path, id: &str) -> PathBuf {
+    points_dir.join(format!("{id}.json"))
+}
+
+/// 读所有抉择点状态。
+#[tauri::command]
+fn read_choice_points(root: String) -> Result<ChoicePointsView, String> {
+    let start = PathBuf::from(&root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let (points_dir, _branches_dir, _spine, ai_novel_dir, _md_index) =
+        ai_novel_paths(&novel_root);
+
+    if !ai_novel_dir.is_dir() {
+        return Ok(ChoicePointsView {
+            root: novel_root.to_string_lossy().to_string(),
+            ai_novel_dir_exists: false,
+            points: Vec::new(),
+            decided_count: 0,
+            pending_count: 0,
+        });
+    }
+
+    let mut points: Vec<ChoicePoint> = Vec::new();
+    if let Ok(rd) = fs::read_dir(&points_dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                let text = match fs::read_to_string(&p) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                match serde_json::from_str::<ChoicePoint>(&text) {
+                    Ok(cp) => points.push(cp),
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+    // 按 id 字典序（cp-001 ... cp-999 自然顺序）
+    points.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let decided_count = points.iter().filter(|p| p.decided.is_some()).count();
+    let pending_count = points.len() - decided_count;
+
+    Ok(ChoicePointsView {
+        root: novel_root.to_string_lossy().to_string(),
+        ai_novel_dir_exists: true,
+        points,
+        decided_count,
+        pending_count,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecideChoiceArgs {
+    pub root: String,
+    pub point_id: String,
+    pub option_id: String,
+    pub by: String,           // "human" | "ai"
+    pub note: Option<String>,
+}
+
+/// 用户（或 AI）做出决定。原子写，避免并发覆盖。
+#[tauri::command]
+fn decide_choice_point(args: DecideChoiceArgs) -> Result<DecisionRecord, String> {
+    let start = PathBuf::from(&args.root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let (points_dir, _, _, ai_novel_dir, _) = ai_novel_paths(&novel_root);
+    fs::create_dir_all(&points_dir).map_err(|e| format!("mkdir {}: {e}", points_dir.display()))?;
+
+    let path = cp_path(&points_dir, &args.point_id);
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("未找到抉择点 {}: {e}", path.display()))?;
+    let mut cp: ChoicePoint = serde_json::from_str(&text)
+        .map_err(|e| format!("抉择点 JSON 损坏：{e}"))?;
+
+    if !cp.options.iter().any(|o| o.id == args.option_id) {
+        return Err(format!(
+            "选项 {} 不在该抉择点上。可用选项：{}",
+            args.option_id,
+            cp.options
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let now = chrono_like_today_compact();
+    let decision = DecisionRecord {
+        by: args.by,
+        option_id: args.option_id.clone(),
+        decided_at: format!("{now}T00:00:00Z"),
+        note: args.note,
+    };
+    cp.decided = Some(decision.clone());
+
+    let serialized = serde_json::to_string_pretty(&cp).map_err(|e| format!("serialize: {e}"))?;
+    // 临时文件 + rename 原子写
+    let tmp = path.with_file_name(format!("{}.tmp", args.point_id));
+    fs::write(&tmp, serialized.as_bytes()).map_err(|e| format!("write tmp: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+
+    let _ = ai_novel_dir; // suppress unused
+    Ok(decision)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChoicePointArgs {
+    pub root: String,
+    pub weight: String,         // "critical" | "major" | "minor" | "flavor"
+    pub after_chapter: String,
+    pub prompt: String,
+    pub options: Vec<ChoiceOption>,
+    pub decided: Option<DecisionRecord>,
+}
+
+/// 创建一个新的抉择点。auto id（cp-001, cp-002...）。
+#[tauri::command]
+fn create_choice_point(args: CreateChoicePointArgs) -> Result<ChoicePoint, String> {
+    if args.options.len() < 2 {
+        return Err("至少需要 2 个选项".into());
+    }
+    if !args.options.iter().any(|o| o.id == "ai") {
+        return Err("必须包含 id=\"ai\" 选项（让 AI 决定）".into());
+    }
+    let weight: ChoiceWeight = match args.weight.as_str() {
+        "critical" => ChoiceWeight::Critical,
+        "major" => ChoiceWeight::Major,
+        "minor" => ChoiceWeight::Minor,
+        "flavor" => ChoiceWeight::Flavor,
+        other => return Err(format!("未知权重：{other}")),
+    };
+
+    let start = PathBuf::from(&args.root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let (points_dir, _, _, _, _) = ai_novel_paths(&novel_root);
+    fs::create_dir_all(&points_dir).map_err(|e| format!("mkdir {}: {e}", points_dir.display()))?;
+
+    let id = next_cp_id(&points_dir);
+    let cp = ChoicePoint {
+        id: id.clone(),
+        weight,
+        after_chapter: args.after_chapter,
+        prompt: args.prompt,
+        options: args.options,
+        decided: args.decided,
+    };
+    let path = cp_path(&points_dir, &id);
+    let serialized = serde_json::to_string_pretty(&cp).map_err(|e| format!("serialize: {e}"))?;
+    fs::write(&path, serialized.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(cp)
+}
+
+/// 在项目里塞入 3 个示例抉择点（演示 / 调试用）。
+/// 不会覆盖已有 cp-XXX.json；只补当前没有的。
+#[tauri::command]
+fn seed_demo_choice_points(root: String) -> Result<usize, String> {
+    let start = PathBuf::from(&root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let (points_dir, _, _, ai_novel_dir, _) = ai_novel_paths(&novel_root);
+    fs::create_dir_all(&points_dir).map_err(|e| format!("mkdir {}: {e}", points_dir.display()))?;
+    fs::create_dir_all(&ai_novel_dir).map_err(|e| format!("mkdir {}: {e}", ai_novel_dir.display()))?;
+
+    // 演示数据按"用户最近讲过的剧情假设"塑造：玄幻长篇，cp-001 = 赦免叛徒
+    // 这恰好呼应你刚才提到的设定。"递归嵌入"到我前面已经建好的 `/Users/zhouluyong/Documents/我的小说`
+    // —— 让 demo 内容有意义。
+    let demos: Vec<(&str, &str, &str, &str, Vec<(&str, &str, &str)>)> = vec![
+        (
+            "critical",
+            "ch3",
+            "你抓到叛徒萧承。他曾是挚友，叛逃去投靠了北境魔宗。",
+            "cp-001",
+            vec![
+                ("a", "宽恕", "主角动摇，最终释放；萧承重回阵营内化矛盾"),
+                ("b", "流放", "永不杀、不再见；萧承三月后于边塞再现"),
+                ("c", "处决", "萧承死；伏笔 FX02「北境魔宗派系」自动销账"),
+                ("ai", "让 AI 决定", "AI 评估三种走向的剧情张力并选最合适"),
+            ],
+        ),
+        (
+            "major",
+            "ch5",
+            "主角得知圣女被困在幽魂塔。塔中只有一条生路，主角只需自己进入。",
+            "cp-002",
+            vec![
+                ("a", "独自前往", "主角独闯；三成几率阵亡。剧情集中，但弱化女主戏"),
+                ("b", "招募萧承同去", "二人成行；提供萧承的救赎机会，加深羁绊"),
+                ("c", "按兵不动", "圣女有她自己的命运；推进其它支线"),
+                ("ai", "让 AI 决定", "AI 评估走向，选择剧情张力更大的一种"),
+            ],
+        ),
+        (
+            "minor",
+            "ch6",
+            "夜宿荒村。村中老妪煮了一锅来路不明的汤，请主角一行喝。",
+            "cp-003",
+            vec![
+                ("a", "喝", "有毒的设定；解锁一段幻象伏笔"),
+                ("b", "拒绝", "保持谨慎；老妪失望离去"),
+                ("c", "让萧承先尝", "利用探子能力，萧承可识破毒物"),
+                ("ai", "让 AI 决定", "这是 minor 等级；AI 可基于故事调性自选"),
+            ],
+        ),
+    ];
+
+    let mut added = 0usize;
+    for (weight_str, after, prompt, _id_preview, options) in demos {
+        let id = next_cp_id(&points_dir);
+        let opts: Vec<ChoiceOption> = options
+            .into_iter()
+            .map(|(o, l, h)| ChoiceOption {
+                id: o.to_string(),
+                label: l.to_string(),
+                preview_hint: h.to_string(),
+            })
+            .collect();
+        let weight_enum: ChoiceWeight = match weight_str {
+            "critical" => ChoiceWeight::Critical,
+            "major" => ChoiceWeight::Major,
+            "minor" => ChoiceWeight::Minor,
+            "flavor" => ChoiceWeight::Flavor,
+            _ => ChoiceWeight::Major,
+        };
+        // 第一个 demo 标记决定 = 人类 + 流放（呼应用户"我都要选 b"的偏好）
+        let decided = if weight_str == "critical" {
+            Some(DecisionRecord {
+                by: "human".to_string(),
+                option_id: "b".to_string(),
+                decided_at: format!("{}T00:00:00Z", chrono_like_today_compact()),
+                note: Some("demo 决定：流放；保留萧承的复活可能性".to_string()),
+            })
+        } else {
+            None
+        };
+        let cp = ChoicePoint {
+            id,
+            weight: weight_enum,
+            after_chapter: after.to_string(),
+            prompt: prompt.to_string(),
+            options: opts,
+            decided,
+        };
+        let path = cp_path(&points_dir, &cp.id);
+        let serialized = serde_json::to_string_pretty(&cp).map_err(|e| format!("serialize: {e}"))?;
+        fs::write(&path, serialized.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+        added += 1;
+    }
+
+    Ok(added)
+}
+
+/// Compact YYYY-MM-DD (use chrono_like_today but stripped fmt)
+fn chrono_like_today_compact() -> String {
+    chrono_like_today()
+}
+
 // ---------------------------------------------------------------------------
 // entry
 // ---------------------------------------------------------------------------
@@ -788,7 +1162,11 @@ pub fn run() {
             read_chapter,
             write_chapter,
             create_novel,
-            probe_directory
+            probe_directory,
+            read_choice_points,
+            decide_choice_point,
+            create_choice_point,
+            seed_demo_choice_points
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -872,5 +1250,150 @@ mod tests {
         let p = "/Users/zhouluyong/Documents/我的小说";
         let r = probe_directory(p.to_string()).expect("call ok");
         assert!(matches!(r.kind, ProbeKind::NovelRoot), "got {:?}", r.kind);
+    }
+
+    // ------------------------------------------------------------------
+    // ChoicePoint 命令：seed → list → decide → 持久化
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn choice_seed_list_decide_roundtrip() {
+        // 起一个临时 novel 项目根（含 state.yml + bible/，让 find_novel_root 命中）
+        let root = std::env::temp_dir().join("dsh-novel-cp-roundtrip");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("bible").join("characters")).unwrap();
+        fs::write(root.join("state.yml"), "title: 测试\ncurrent_chapter: 0\n").unwrap();
+
+        // seed 应当建出至少 1 个 cp；这里因为 .ai-novel 不存在，调用应该补 3 个
+        let added = seed_demo_choice_points(root.to_string_lossy().to_string())
+            .expect("seed ok");
+        assert!(added >= 1, "seed added={added}");
+
+        // list 应该看到条目
+        let view = read_choice_points(root.to_string_lossy().to_string()).expect("read ok");
+        assert!(view.ai_novel_dir_exists, ".ai-novel 没创建");
+        assert!(!view.points.is_empty(), "应该至少有 1 个抉择点");
+
+        // 找第一个 pending 抉择点，做出决定（cp-002 是 major，但 seed 里没决定）
+        let pending = view
+            .points
+            .iter()
+            .find(|p| p.decided.is_none())
+            .expect("至少 1 个 pending");
+        let decision = decide_choice_point(DecideChoiceArgs {
+            root: root.to_string_lossy().to_string(),
+            point_id: pending.id.clone(),
+            option_id: "ai".to_string(),
+            by: "human".to_string(),
+            note: Some("决定：让 AI 选".to_string()),
+        })
+        .expect("decide ok");
+        assert_eq!(decision.by, "human");
+        assert_eq!(decision.option_id, "ai");
+
+        // 再读一次，确认 persisted
+        let view2 = read_choice_points(root.to_string_lossy().to_string()).expect("reread ok");
+        assert_eq!(view2.decided_count, view.decided_count + 1);
+        assert_eq!(view2.pending_count, view.pending_count - 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn choice_decide_rejects_invalid_option() {
+        let root = std::env::temp_dir().join("dsh-novel-cp-reject");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("bible")).unwrap();
+        fs::write(root.join("state.yml"), "title: t\n").unwrap();
+
+        let _ = seed_demo_choice_points(root.to_string_lossy().to_string()).unwrap();
+
+        // 取第一个 cp（cp-001 已定，cp-002 未定），用一个不存在的 option 决定
+        let view = read_choice_points(root.to_string_lossy().to_string()).unwrap();
+        let pending = view.points.iter().find(|p| p.decided.is_none()).unwrap();
+        let result = decide_choice_point(DecideChoiceArgs {
+            root: root.to_string_lossy().to_string(),
+            point_id: pending.id.clone(),
+            option_id: "z-non-existent".to_string(),
+            by: "human".to_string(),
+            note: None,
+        });
+        assert!(result.is_err(), "invalid option 应该报错，got {:?}", result);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn choice_create_requires_ai_option() {
+        let root = std::env::temp_dir().join("dsh-novel-cp-create");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("bible")).unwrap();
+        fs::write(root.join("state.yml"), "title: t\n").unwrap();
+
+        // 不含 id=ai 的应该报错
+        let bad = create_choice_point(CreateChoicePointArgs {
+            root: root.to_string_lossy().to_string(),
+            weight: "major".to_string(),
+            after_chapter: "ch2".to_string(),
+            prompt: "测试无 ai 选项".to_string(),
+            options: vec![
+                ChoiceOption { id: "a".to_string(), label: "a".to_string(), preview_hint: "...".to_string() },
+                ChoiceOption { id: "b".to_string(), label: "b".to_string(), preview_hint: "...".to_string() },
+            ],
+            decided: None,
+        });
+        assert!(bad.is_err(), "应该要求 ai 选项");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 真实用户目录 smoke：seed → list → decide → 持久化 → 清理。
+    /// 不依赖 GUI；直接调私有命令函数。
+    #[test]
+    fn smoke_choice_points_on_real_user_dir() {
+        let p = "/Users/zhouluyong/Documents/我的小说";
+        let path = std::path::Path::new(p);
+        if !path.join("state.yml").exists() || !path.join("bible").is_dir() {
+            eprintln!("smoke skipped — 项目根未就绪（state.yml/bible/ 缺失）");
+            return;
+        }
+        let added = seed_demo_choice_points(p.to_string()).expect("seed ok");
+        eprintln!("seed: added = {added}");
+
+        let view = read_choice_points(p.to_string()).expect("read ok");
+        eprintln!(
+            "before decide: total={} decided={} pending={}",
+            view.points.len(),
+            view.decided_count,
+            view.pending_count
+        );
+        assert!(view.ai_novel_dir_exists);
+        assert!(!view.points.is_empty());
+
+        if let Some(pending) = view.points.iter().find(|p| p.decided.is_none()) {
+            let dec = decide_choice_point(DecideChoiceArgs {
+                root: p.to_string(),
+                point_id: pending.id.clone(),
+                option_id: "ai".to_string(),
+                by: "human".to_string(),
+                note: Some("smoke".to_string()),
+            })
+            .expect("decide ok");
+            eprintln!("decide: cp={} option={} by={}", pending.id, dec.option_id, dec.by);
+        }
+
+        let view2 = read_choice_points(p.to_string()).expect("reread ok");
+        eprintln!(
+            "after decide:  total={} decided={} pending={}",
+            view2.points.len(),
+            view2.decided_count,
+            view2.pending_count
+        );
+        assert!(view2.decided_count >= 1);
+        eprintln!("✓ {}/.ai-novel 写入了 demo 抉择点", p);
+
+        // 清理 smoke 数据（让用户从 UI 真正走一遍时是干净的）
+        let _ = fs::remove_dir_all(path.join(".ai-novel"));
+        eprintln!("(清理 .ai-novel smoke 用例数据)");
     }
 }

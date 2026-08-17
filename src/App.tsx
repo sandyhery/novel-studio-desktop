@@ -4,8 +4,9 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { BibleMeta, Chapter, NovelState, NovelSummary, Probe } from "./types";
 import { fmtChars, fmtDate } from "./types";
 import CreateNovelModal from "./CreateNovelModal";
+import StoryboardPanel from "./StoryboardPanel";
 
-type Panel = "overview" | "chapters" | "bible" | "editor";
+type Panel = "overview" | "chapters" | "bible" | "editor" | "storyboard";
 
 interface BibleSelection {
   /** "timeline" / "foreshadowing" / "characters/林楚" 这种带不带路径的 key */
@@ -201,6 +202,19 @@ export default function App() {
             <span>章节编辑器</span>
             {!chapterSaved && <span className="dot warn" title="有未保存的修改" />}
           </button>
+          <button
+            className={`nav-item ${panel === "storyboard" ? "active" : ""}`}
+            onClick={() => setPanel("storyboard")}
+            disabled={!summary}
+          >
+            <span className="nav-icon">🎯</span>
+            <span>剧情走向</span>
+            {summary && summary.state.foreshadowingOpen > 0 && (
+              <span className="muted small" style={{ marginLeft: 4 }}>
+                · 可定 {summary.state.foreshadowingOpen}
+              </span>
+            )}
+          </button>
 
           {summary && (
             <div className="section">
@@ -318,6 +332,10 @@ export default function App() {
               error={bibleError}
               onSelect={openBible}
             />
+          )}
+
+          {summary && panel === "storyboard" && (
+            <StoryboardPanel root={summary.root} />
           )}
 
           {summary && panel === "editor" && (

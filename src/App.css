@@ -677,3 +677,147 @@ code {
   gap: 8px;
   margin-top: 8px;
 }
+
+/* ---------- 抉择点 / 剧情走向面板 ---------- */
+
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 14px;
+}
+
+.choice-card {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.choice-card .card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+.choice-card .card-name {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  flex: 1;
+}
+.choice-card .card-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.badge.danger {
+  background: rgba(248, 81, 73, 0.1);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.badge.warn {
+  background: rgba(227, 179, 65, 0.1);
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.badge.muted {
+  background: var(--bg);
+  color: var(--muted);
+}
+
+.options-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.options-list.large {
+  gap: 10px;
+}
+.option {
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  cursor: default;
+}
+.option.pickable {
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.option.pickable:hover {
+  border-color: var(--accent);
+  background: var(--bg-elev);
+}
+.option.chosen {
+  border-color: var(--accent);
+  background: rgba(110, 168, 254, 0.06);
+}
+.option.ai-option {
+  border-style: dashed;
+}
+.option-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.option-label {
+  font-weight: 600;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chosen-mark {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 14px;
+}
+.option-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.decision-strip {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: rgba(110, 168, 254, 0.05);
+  border: 1px dashed var(--accent);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.decision-strip > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.decision-note {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.choice-modal {
+  width: min(680px, calc(100vw - 40px));
+}
+.choice-prompt {
+  font-size: 15px;
+  line-height: 1.6;
+  margin: 0 0 14px;
+}
+.choice-modal .md-editor.small {
+  min-height: 70px;
+  resize: vertical;
+}
