@@ -114,6 +114,27 @@ pub struct WriteChapterArgs {
     pub root: String,
     pub file: String,
     pub content: String,
+    /// 打开章节时记录的文件指纹；保存时若磁盘版本已变，返回 conflict 而不写盘。
+    /// 传 None 表示强制覆盖（跳过脏检查）。
+    pub base_fingerprint: Option<Fingerprint>,
+}
+
+/// 文件指纹：mtime（Unix 毫秒）+ 字节数。用于双向打通时的写前脏检查。
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct Fingerprint {
+    pub mtime_ms: u64,
+    pub size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteChapterResult {
+    pub ok: bool,
+    pub conflict: bool,
+    /// 写盘后的最新指纹（成功时），或磁盘当前指纹（冲突时）。
+    pub mtime_ms: u64,
+    pub size: u64,
 }
 
 /// 新建小说项目的全部要素（向导一次性收集，前端确认后整批下发）。
@@ -582,8 +603,9 @@ fn read_chapter(root: String, file: String) -> Result<String, String> {
 }
 
 /// 保存一个章节（覆盖写）。防呆：file 必须不含 `/`，且必须 .md 后缀。
+/// 若传了 base_fingerprint，写前做脏检查：磁盘 mtime/size 与指纹不一致 → 返回 conflict。
 #[tauri::command]
-fn write_chapter(args: WriteChapterArgs) -> Result<(), String> {
+fn write_chapter(args: WriteChapterArgs) -> Result<WriteChapterResult, String> {
     if args.file.contains('/')
         || args.file.contains("..")
         || !args.file.ends_with(".md")
@@ -594,7 +616,157 @@ fn write_chapter(args: WriteChapterArgs) -> Result<(), String> {
     let novel_root = find_novel_root(&start)
         .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
     let path = novel_root.join("chapters").join(&args.file);
-    fs::write(&path, args.content.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
+
+    // 写前脏检查：仅当调用方给了 base 指纹时进行
+    if let Some(fp) = args.base_fingerprint {
+        if let Ok(meta) = fs::metadata(&path) {
+            let disk_mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let disk_size = meta.len();
+            if disk_mtime != fp.mtime_ms || disk_size != fp.size {
+                return Ok(WriteChapterResult {
+                    ok: false,
+                    conflict: true,
+                    mtime_ms: disk_mtime,
+                    size: disk_size,
+                });
+            }
+        }
+    }
+
+    fs::write(&path, args.content.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+
+    // 写盘后的最新指纹（前端用来更新 base，避免下次保存误报冲突）
+    let (mtime_ms, size) = match fs::metadata(&path) {
+        Ok(m) => (
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            m.len(),
+        ),
+        Err(_) => (0, args.content.len() as u64),
+    };
+    Ok(WriteChapterResult {
+        ok: true,
+        conflict: false,
+        mtime_ms,
+        size,
+    })
+}
+
+/// 取某文件的指纹（mtime 毫秒 + 字节数）；文件不存在返回 None。
+fn file_fingerprint(path: &Path) -> Option<Fingerprint> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some(Fingerprint {
+        mtime_ms,
+        size: meta.len(),
+    })
+}
+
+/// 文件快照里的一条记录（相对小说根路径 + mtime + 大小）。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStamp {
+    pub path: String,
+    pub mtime_ms: u64,
+    pub size: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadChangesArgs {
+    pub root: String,
+    /// 上次快照；None 表示首次调用（只返回当前快照，changed=false）。
+    pub last_seen: Option<Vec<FileStamp>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadChangesResult {
+    pub changed: bool,
+    pub stamps: Vec<FileStamp>,
+}
+
+/// 收集小说项目快照：state.yml + bible/（含 characters/）+ chapters/，只 stat 不读内容。
+fn collect_stamps(root: &Path) -> Vec<FileStamp> {
+    let mut out = Vec::new();
+    if let Some(fp) = file_fingerprint(&root.join("state.yml")) {
+        out.push(FileStamp { path: "state.yml".into(), mtime_ms: fp.mtime_ms, size: fp.size });
+    }
+    let bible = root.join("bible");
+    if let Ok(entries) = fs::read_dir(&bible) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_file() && name.ends_with(".md") {
+                if let Some(fp) = file_fingerprint(&p) {
+                    out.push(FileStamp { path: format!("bible/{name}"), mtime_ms: fp.mtime_ms, size: fp.size });
+                }
+            } else if p.is_dir() && name == "characters" {
+                if let Ok(chars) = fs::read_dir(&p) {
+                    for c in chars.flatten() {
+                        let cp = c.path();
+                        let cn = c.file_name().to_string_lossy().to_string();
+                        if cp.is_file() && cn.ends_with(".md") {
+                            if let Some(fp) = file_fingerprint(&cp) {
+                                out.push(FileStamp { path: format!("bible/characters/{cn}"), mtime_ms: fp.mtime_ms, size: fp.size });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let chapters = root.join("chapters");
+    if let Ok(entries) = fs::read_dir(&chapters) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_file() && name.ends_with(".md") {
+                if let Some(fp) = file_fingerprint(&p) {
+                    out.push(FileStamp { path: format!("chapters/{name}"), mtime_ms: fp.mtime_ms, size: fp.size });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// 廉价变更检测：只 stat（不读正文），对比上次快照，返回是否有变化 + 当前快照。
+/// 供前端 2s 轮询：DSH agent / 插件 / 任意编辑器改动了文件，桌面端据此自动刷新看板。
+#[tauri::command]
+fn read_changes(args: ReadChangesArgs) -> Result<ReadChangesResult, String> {
+    let start = PathBuf::from(&args.root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let stamps = collect_stamps(&novel_root);
+    let changed = match args.last_seen {
+        None => false, // 首次：只播种快照，不算变化
+        Some(prev) => {
+            if prev.len() != stamps.len() {
+                true
+            } else {
+                prev.iter().zip(stamps.iter()).any(|(a, b)| {
+                    a.path != b.path || a.mtime_ms != b.mtime_ms || a.size != b.size
+                })
+            }
+        }
+    };
+    Ok(ReadChangesResult { changed, stamps })
 }
 
 /// 新建小说项目：
@@ -2816,7 +2988,8 @@ pub fn run() {
             ai_full_pipeline,
             read_story_spine,
             git_commit,
-            git_init
+            git_init,
+            read_changes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3086,6 +3259,83 @@ mod tests {
         let r3 = git_commit(root.clone(), Some("again".into())).expect("commit call");
         assert!(!r3.committed, "无改动不应再提交");
         assert!(r3.summary.contains("没有需要提交的改动"), "got {}", r3.summary);
+
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// 写前脏检查：指纹一致 → 覆盖成功；指纹不一致 → conflict；None → 强制覆盖。
+    #[test]
+    fn write_chapter_dirty_check() {
+        let _guard = lock_real_dir();
+        let p = std::env::temp_dir().join("dsh-novel-write-check");
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(p.join("bible")).unwrap();
+        fs::create_dir_all(p.join("chapters")).unwrap();
+        fs::write(p.join("state.yml"), "title: t\ncurrent_chapter: 1\n").unwrap();
+        fs::write(p.join("chapters").join("ch01.md"), "# 第一章\n旧\n").unwrap();
+        let root = p.to_string_lossy().to_string();
+        let chapter_path = p.join("chapters").join("ch01.md");
+
+        let fp = file_fingerprint(&chapter_path).expect("指纹应存在");
+
+        // 指纹一致 → 覆盖成功
+        let r1 = write_chapter(WriteChapterArgs {
+            root: root.clone(),
+            file: "ch01.md".into(),
+            content: "# 第一章\n新正文更长\n".into(),
+            base_fingerprint: Some(fp),
+        })
+        .expect("write ok");
+        assert!(r1.ok && !r1.conflict, "指纹一致应成功，got {:?}", (r1.ok, r1.conflict));
+
+        // 指纹不一致（旧指纹）→ conflict
+        let r2 = write_chapter(WriteChapterArgs {
+            root: root.clone(),
+            file: "ch01.md".into(),
+            content: "覆盖".into(),
+            base_fingerprint: Some(fp),
+        })
+        .expect("write ok");
+        assert!(!r2.ok && r2.conflict, "指纹已过期应冲突，got {:?}", (r2.ok, r2.conflict));
+
+        // None → 强制覆盖
+        let r3 = write_chapter(WriteChapterArgs {
+            root: root.clone(),
+            file: "ch01.md".into(),
+            content: "强制覆盖".into(),
+            base_fingerprint: None,
+        })
+        .expect("write ok");
+        assert!(r3.ok && !r3.conflict, "强制覆盖应成功");
+
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// 变更检测：首次播种 → 无变化；改动后 → changed=true；stamps 覆盖 state.yml/chapters。
+    #[test]
+    fn read_changes_detects_external_edit() {
+        let _guard = lock_real_dir();
+        let p = std::env::temp_dir().join("dsh-novel-changes-test");
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(p.join("bible")).unwrap();
+        fs::create_dir_all(p.join("chapters")).unwrap();
+        fs::write(p.join("state.yml"), "title: t\ncurrent_chapter: 1\n").unwrap();
+        fs::write(p.join("chapters").join("ch01.md"), "# 第一章\n正文\n").unwrap();
+        let root = p.to_string_lossy().to_string();
+
+        let seed = read_changes(ReadChangesArgs { root: root.clone(), last_seen: None }).expect("seed");
+        assert!(!seed.changed, "首次播种不应算变化");
+        assert!(seed.stamps.iter().any(|s| s.path == "state.yml"));
+        assert!(seed.stamps.iter().any(|s| s.path == "chapters/ch01.md"));
+
+        // 无改动 → changed=false
+        let same = read_changes(ReadChangesArgs { root: root.clone(), last_seen: Some(seed.stamps.clone()) }).expect("same");
+        assert!(!same.changed, "无改动不应报变化");
+
+        // 外部改动章节 → changed=true
+        fs::write(p.join("chapters").join("ch01.md"), "# 第一章\n改过了\n").unwrap();
+        let diff = read_changes(ReadChangesArgs { root: root.clone(), last_seen: Some(seed.stamps) }).expect("diff");
+        assert!(diff.changed, "改动后应报变化");
 
         let _ = fs::remove_dir_all(&p);
     }

@@ -1080,6 +1080,19 @@ code {
 .goal-banner.reached .goal-fill { background: var(--success); }
 .goal-foot { text-align: right; }
 
+/* 外部改动横幅（双向打通：编辑中的章被别处改过） */
+.external-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--warn);
+  background: rgba(227, 179, 65, 0.08);
+  color: var(--warn);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
 /* 阅读视图（Markdown 渲染成排版正文） */
 .md-view {
   flex: 1;

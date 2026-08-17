@@ -345,3 +345,32 @@ export interface GitInitResult {
   repoExists: boolean;
   summary: string;
 }
+
+// ---------------------------------------------------------------------------
+// 双向打通（#8）：文件指纹 + 变更检测 + 写冲突
+// ---------------------------------------------------------------------------
+
+/** 文件指纹（mtime 毫秒 + 字节数），用于判断「磁盘版本 vs 内存草稿」是否一致。 */
+export interface Fingerprint {
+  mtimeMs: number;
+  size: number;
+}
+
+export interface WriteChapterResult {
+  ok: boolean;
+  conflict: boolean;
+  mtimeMs: number;
+  size: number;
+}
+
+export interface FileStamp {
+  /** 相对小说根的路径，如 "chapters/ch01.md" / "bible/timeline.md" / "state.yml" */
+  path: string;
+  mtimeMs: number;
+  size: number;
+}
+
+export interface ReadChangesResult {
+  changed: boolean;
+  stamps: FileStamp[];
+}

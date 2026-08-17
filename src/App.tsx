@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import type { BibleMeta, Chapter, GitCommitResult, GitInitResult, NovelState, NovelSummary, Probe } from "./types";
+import type { BibleMeta, Chapter, FileStamp, Fingerprint, GitCommitResult, GitInitResult, NovelState, NovelSummary, Probe, ReadChangesResult, WriteChapterResult } from "./types";
 import { fmtChars, fmtDate } from "./types";
 import CreateNovelModal from "./CreateNovelModal";
 import StoryboardPanel from "./StoryboardPanel";
@@ -41,6 +41,16 @@ export default function App() {
   const [chapterDraft, setChapterDraft] = useState<string>("");
   const [chapterSaved, setChapterSaved] = useState<boolean>(true);
   const [saving, setSaving] = useState(false);
+  const [baseFingerprint, setBaseFingerprint] = useState<Fingerprint | null>(null);
+  const [conflict, setConflict] = useState<{ mtimeMs: number; size: number } | null>(null);
+  const [externallyModified, setExternallyModified] = useState(false);
+
+  // 供轮询 / 回调读取最新值的 ref（避免闭包过期）。
+  const stampsRef = useRef<FileStamp[] | null>(null);
+  const editingChapterRef = useRef<Chapter | null>(null);
+  const baseFingerprintRef = useRef<Fingerprint | null>(null);
+  const busyRef = useRef(false);
+  const savingRef = useRef(false);
   const [showCreate, setShowCreate] = useState(false);
   const [dshSessionId, setDshSessionId] = useState<string | null>(null);
   const [probe, setProbe] = useState<Probe | null>(null);
@@ -146,26 +156,30 @@ export default function App() {
   }, []);
 
   const loadSummary = useCallback(
-    async (rootPath: string) => {
+    async (rootPath: string): Promise<NovelSummary | null> => {
       setBusy(true);
       setError(null);
       setSummary(null);
       setProbe(null);
       setProbeFor(rootPath);
+      // 重载后让轮询重新播种快照，避免把「自己刚写的改动」误判为外部变化
+      stampsRef.current = null;
       try {
         const s = await invoke<NovelSummary>("read_summary", { root: rootPath });
         if (!s.ok) {
           setError("read_summary 返回 ok=false");
           await runProbe(rootPath);
-          return;
+          return null;
         }
         setSummary(s);
         setRoot(s.root);
         setSelectedBible(null);
         setBibleContent("");
+        return s;
       } catch (e) {
         setError(String(e));
         await runProbe(rootPath);
+        return null;
       } finally {
         setBusy(false);
       }
@@ -210,6 +224,9 @@ export default function App() {
     setChapterDraft("");
     setChapterSaved(true);
     setSaving(false);
+    setConflict(null);
+    setExternallyModified(false);
+    setBaseFingerprint({ mtimeMs: chap.modifiedMs, size: chap.bytes });
     try {
       const text = await invoke<string>("read_chapter", { root, file: chap.file });
       setChapterDraft(text);
@@ -218,25 +235,98 @@ export default function App() {
     }
   }, [root]);
 
-  const saveChapter = useCallback(async () => {
+  const saveChapter = useCallback(async (force = false) => {
     if (!root || !editingChapter) return;
     setSaving(true);
     try {
-      await invoke("write_chapter", {
+      const res = await invoke<WriteChapterResult>("write_chapter", {
         args: {
           root,
           file: editingChapter.file,
           content: chapterDraft,
+          baseFingerprint: force ? null : baseFingerprint,
         },
       });
+      if (!res.ok && res.conflict) {
+        setConflict({ mtimeMs: res.mtimeMs, size: res.size });
+        return;
+      }
       setChapterSaved(true);
+      setBaseFingerprint({ mtimeMs: res.mtimeMs, size: res.size });
+      setConflict(null);
+      setExternallyModified(false);
       await loadSummary(root);
     } catch (e) {
       setError(String(e));
     } finally {
       setSaving(false);
     }
-  }, [root, editingChapter, chapterDraft, loadSummary]);
+  }, [root, editingChapter, chapterDraft, baseFingerprint, loadSummary]);
+
+  // 冲突时「载入磁盘版本」：重读正文 + 刷新该章指纹（放弃本地草稿）。
+  const reloadChapterFromDisk = useCallback(async () => {
+    if (!root || !editingChapter) return;
+    try {
+      const text = await invoke<string>("read_chapter", { root, file: editingChapter.file });
+      setChapterDraft(text);
+      setChapterSaved(true);
+      setConflict(null);
+      setExternallyModified(false);
+      const s = await loadSummary(root);
+      if (s) {
+        const fresh = s.chapters.find((c) => c.file === editingChapter.file);
+        if (fresh) {
+          setEditingChapter(fresh);
+          setBaseFingerprint({ mtimeMs: fresh.modifiedMs, size: fresh.bytes });
+        }
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [root, editingChapter, loadSummary]);
+
+  // —— 自动刷新（A）：2s 轮询廉价变更检测，有外部改动才刷看板 ——
+  useEffect(() => { editingChapterRef.current = editingChapter; }, [editingChapter]);
+  useEffect(() => { baseFingerprintRef.current = baseFingerprint; }, [baseFingerprint]);
+  useEffect(() => { busyRef.current = busy; }, [busy]);
+  useEffect(() => { savingRef.current = saving; }, [saving]);
+
+  useEffect(() => {
+    if (!root) return;
+    let cancelled = false;
+    const tick = async () => {
+      if (document.hidden || busyRef.current || savingRef.current) return;
+      try {
+        const res = await invoke<ReadChangesResult>("read_changes", {
+          args: { root, lastSeen: stampsRef.current },
+        });
+        if (cancelled) return;
+        stampsRef.current = res.stamps;
+
+        if (res.changed) {
+          void loadSummary(root);
+        }
+
+        // 正在编辑的章若被外部改动 → 提示（不自动覆盖草稿）
+        const editing = editingChapterRef.current;
+        const base = baseFingerprintRef.current;
+        if (editing && base) {
+          const ep = `chapters/${editing.file}`;
+          const stamp = res.stamps.find((s) => s.path === ep);
+          if (stamp && (stamp.mtimeMs !== base.mtimeMs || stamp.size !== base.size)) {
+            setExternallyModified(true);
+          }
+        }
+      } catch {
+        // 轮询失败静默忽略（项目刚卸载等）
+      }
+    };
+    const id = setInterval(tick, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [root, loadSummary]);
 
   const totalChars = useMemo(
     () => summary?.chapters.reduce((sum, c) => sum + c.chars, 0) ?? 0,
@@ -251,11 +341,13 @@ export default function App() {
       draft={chapterDraft}
       saved={chapterSaved}
       saving={saving}
+      externallyModified={externallyModified}
+      onReloadDisk={reloadChapterFromDisk}
       onChange={(v) => {
         setChapterDraft(v);
         setChapterSaved(false);
       }}
-      onSave={saveChapter}
+      onSave={() => saveChapter(false)}
       readMode={readMode}
       onToggleReadMode={() => setReadMode((v) => !v)}
       immersed={immersed}
@@ -534,6 +626,43 @@ export default function App() {
             await loadSummary(newRoot);
           }}
         />
+      )}
+
+      {conflict && editingChapter && (
+        <div className="modal-overlay">
+          <div className="modal choice-modal">
+            <div className="modal-header">
+              <h2>⚠️ 磁盘版本已变</h2>
+              <button className="btn ghost" onClick={() => setConflict(null)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <p className="choice-prompt">
+                《{editingChapter.title}》在你编辑期间被别处修改了（DSH agent / 插件 / 其它编辑器）。
+                直接保存会覆盖对方的改动，请选择：
+              </p>
+              <div className="options-list large">
+                <button className="option pickable" onClick={() => void reloadChapterFromDisk()}>
+                  <div className="option-head">
+                    <span className="option-label">📥 载入磁盘版本</span>
+                  </div>
+                  <p className="option-hint">放弃当前草稿，读入磁盘上的最新内容</p>
+                </button>
+                <button className="option pickable" onClick={() => void saveChapter(true)}>
+                  <div className="option-head">
+                    <span className="option-label">💾 仍用我的版本覆盖</span>
+                  </div>
+                  <p className="option-hint">保留我的草稿并覆盖磁盘（对方的改动会丢失）</p>
+                </button>
+                <button className="option pickable" onClick={() => setConflict(null)}>
+                  <div className="option-head">
+                    <span className="option-label">↩ 取消</span>
+                  </div>
+                  <p className="option-hint">继续编辑，稍后再处理</p>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -852,6 +981,8 @@ function EditorPanel(props: {
   draft: string;
   saved: boolean;
   saving: boolean;
+  externallyModified: boolean;
+  onReloadDisk: () => void;
   onChange: (v: string) => void;
   onSave: () => void;
   readMode: boolean;
@@ -938,6 +1069,16 @@ function EditorPanel(props: {
           保存
         </button>
       </div>
+
+      {props.externallyModified && (
+        <div className="external-banner">
+          <span>⚠️ 该文件已在别处被修改（DSH agent / 插件 / 其它编辑器）。</span>
+          <div className="spacer" />
+          <button className="btn" onClick={props.onReloadDisk}>
+            📥 重载磁盘版本
+          </button>
+        </div>
+      )}
 
       {goal > 0 && (
         <WordGoalBanner wordCount={wordCount} goal={goal} reached={reached} ratio={ratio} remain={remain} />
