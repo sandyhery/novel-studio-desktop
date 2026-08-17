@@ -301,5 +301,27 @@ export interface AiReviseChapterResult {
   error: string | null;
 }
 
+export interface AiFullPipelineArgs {
+  root: string;
+  instruction?: string | null;
+  autoRevise?: boolean;
+  autoReconcile?: boolean;
+  sessionId?: string | null;
+  timeoutSecs?: number;
+  port?: number;
+}
+
+export interface AiFullPipelineResult {
+  ok: boolean;
+  stage: "write_done" | "reviewed" | "revised" | "done" | "done_revised" | "choice_pending" | "error";
+  chapterFile: string | null;
+  reviewSummary: string | null;
+  verdict: string | null;
+  finalText: string | null;
+  reconcileNote: string | null;
+  sessionId: string | null;
+  error: string | null;
+}
+
 /** 审核问题类别顺序 */
 export const REVIEW_CATEGORY_ORDER = ["A", "B", "C", "D", "P"] as const;

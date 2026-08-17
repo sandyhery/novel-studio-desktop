@@ -1568,12 +1568,13 @@ fn ai_reconcile_bible(args: AiReconcileBibleArgs) -> Result<AiReconcileBibleResu
     let prompt = format!(
         "你是小说连续性守门员。读下面的章节正文与现有 bible 摘录，产出【收尾三件事】的**结构化增量**。\n\
          \n\
-         ## 必须遵守\n\
-         - 只输出一个 JSON 对象，不要输出任何其他文字、不要 markdown 代码块围栏。\n\
+         ## 铁律（违反即失败）\n\
+         - 你的**整个回复**必须是一个合法 JSON 对象：第一个字符是 {{，最后一个字符是 }}。\n\
+         - 绝对不要：markdown 围栏（```）、```json 标记、前言、解释、评论。\n\
          - 不要重写整个文件 —— 只给「追加/替换」的最小增量。\n\
          - 绝对不要输出章节正文或小说草稿。\n\
          \n\
-         ## 输出格式（严格 JSON）\n\
+         ## 输出格式（严格 JSON，只输出这个）\n\
          {{\n\
            \"timelineRows\": [ \"| ch1 | 世界历 47 年秋 | 17 | 王城 | 李四捡到怀表 | 李四 |\" ],\n\
            \"foreshadowingRows\": [ \"| F001 | ch1 | 怀表停在3:47 | 杂货铺 | 埋设 | —\" ],\n\
@@ -1585,6 +1586,7 @@ fn ai_reconcile_bible(args: AiReconcileBibleArgs) -> Result<AiReconcileBibleResu
          - foreshadowingResolve：把对应 ID 的状态从「待收」改为「已收（chN）」\n\
          - characterUpdates：在角色档案的「本章变化记录」追加一行\n\
          - 没有的数组留空 []\n\
+         - 回复里不要有任何 JSON 以外的字符。\n\
          \n\
          ## 用户刚做的决定（若有，影响剧情）\n\
          {decision}\n\
@@ -1754,7 +1756,7 @@ fn extract_json_object(text: &str) -> Option<String> {
 
 /// 在表格的「（追加）」占位行前插入若干行。
 fn insert_rows_before_append(existing: &str, rows: &[String]) -> String {
-    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    let lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
     let mut insert_at: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
         if line.contains("（追加）") || line.contains("(追加)") {
@@ -2042,6 +2044,17 @@ fn ai_review_chapter(args: AiReviewChapterArgs) -> Result<ReviewReport, String> 
         }
     }
 
+    // 审核报告存档到 .ai-novel/reviews/<chapter>-<ts>.json（防丢、可追溯）
+    if report.ok && report.error.is_none() {
+        let reviews_dir = novel_root.join(AI_NOVEL_DIR).join("reviews");
+        let _ = fs::create_dir_all(&reviews_dir);
+        if let Ok(json) = serde_json::to_string_pretty(&report) {
+            let ts = chrono_like_today_compact().replace('-', "");
+            let fname = format!("{}-{}.json", report.chapter_file.replace(".md", ""), ts);
+            let _ = fs::write(reviews_dir.join(fname), json.as_bytes());
+        }
+    }
+
     Ok(report)
 }
 
@@ -2150,6 +2163,203 @@ fn ai_revise_chapter(args: AiReviseChapterArgs) -> Result<AiReviseChapterResult,
         session_id: Some(sid),
         error: None,
     })
+}
+
+// ===========================================================================
+// 一键流水线：写 → 审 → 改 → 终稿
+// ===========================================================================
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiFullPipelineArgs {
+    pub root: String,
+    /// 写作指令（可选，缺省按进度写下一章）
+    pub instruction: Option<String>,
+    /// 是否自动修订（verdict=revise 且 A/B/C 有重大问题时）；默认 true
+    pub auto_revise: Option<bool>,
+    /// 是否自动收尾（reconcile bible）；默认 true
+    pub auto_reconcile: Option<bool>,
+    pub session_id: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub port: Option<u16>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiFullPipelineResult {
+    pub ok: bool,
+    /// 当前所处阶段：write_done / reviewed / revised / done / error
+    pub stage: String,
+    /// 写出的章节文件名
+    pub chapter_file: Option<String>,
+    /// 审核报告摘要
+    pub review_summary: Option<String>,
+    pub verdict: Option<String>,
+    /// 终稿文本（若修订过则是 v2，否则 v1）
+    pub final_text: Option<String>,
+    /// reconcile 结果简述
+    pub reconcile_note: Option<String>,
+    pub session_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 一键走完 写 → 审 → 改 → 收尾 的完整循环。
+/// 每步结束返回 stage，前端可据此刷新 UI。
+#[tauri::command]
+fn ai_full_pipeline(args: AiFullPipelineArgs) -> Result<AiFullPipelineResult, String> {
+    let port = args.port.unwrap_or(dsh_client::default_port());
+    let timeout = args.timeout_secs.unwrap_or(600);
+    let mut session_id = args.session_id.clone();
+
+    // 1. 写
+    let write_res = ai_write_chapter(AiWriteChapterArgs {
+        root: args.root.clone(),
+        instruction: args.instruction.clone(),
+        session_id: session_id.clone(),
+        timeout_secs: Some(timeout.min(300)),
+        port: Some(port),
+    })?;
+
+    if let Some(sid) = write_res.session_id.as_ref() {
+        session_id = Some(sid.clone());
+    }
+    let chapter_file = match write_res.saved_to {
+        Some(f) => f,
+        None => {
+            // 可能有抉择点暂停 —— 此时不能继续流水线
+            return Ok(AiFullPipelineResult {
+                ok: false,
+                stage: if write_res.choice_request.is_some() { "choice_pending" } else { "error" }.into(),
+                chapter_file: None,
+                review_summary: None,
+                verdict: None,
+                final_text: None,
+                reconcile_note: None,
+                session_id,
+                error: if write_res.choice_request.is_some() {
+                    Some("写作遇到抉择点，已暂停等待你决定（请到「AI 写章节」处理后再继续）".into())
+                } else {
+                    write_res.error.clone()
+                },
+            });
+        }
+    };
+
+    // 2. 审
+    let review_res = ai_review_chapter(AiReviewChapterArgs {
+        root: args.root.clone(),
+        chapter_file: Some(chapter_file.clone()),
+        session_id: session_id.clone(),
+        timeout_secs: Some(timeout.min(240)),
+        port: Some(port),
+    })?;
+    if let Some(sid) = review_res.session_id.as_ref() {
+        session_id = Some(sid.clone());
+    }
+
+    let mut final_text = write_res.text.clone();
+    let verdict = review_res.verdict.clone();
+    let review_summary = review_res.summary.clone();
+
+    // 3. 改（若自动修订开启且 verdict=revise 且有 A/B/C 问题）
+    let mut revised = false;
+    let auto_revise = args.auto_revise.unwrap_or(true);
+    if auto_revise && review_res.verdict == "revise" {
+        let abc_count = review_res
+            .categories
+            .get("A")
+            .map(|c| c.issues.len())
+            .unwrap_or(0)
+            + review_res
+                .categories
+                .get("B")
+                .map(|c| c.issues.len())
+                .unwrap_or(0)
+            + review_res
+                .categories
+                .get("C")
+                .map(|c| c.issues.len())
+                .unwrap_or(0);
+        if abc_count > 0 {
+            let revise_res = ai_revise_chapter(AiReviseChapterArgs {
+                root: args.root.clone(),
+                chapter_file: chapter_file.clone(),
+                report_json: Some(
+                    serde_json::to_string(&review_res)
+                        .unwrap_or_default(),
+                ),
+                session_id: session_id.clone(),
+                timeout_secs: Some(timeout.min(240)),
+                port: Some(port),
+            })?;
+            if let Some(sid) = revise_res.session_id.as_ref() {
+                session_id = Some(sid.clone());
+            }
+            if revise_res.ok {
+                final_text = revise_res.revised_text.clone();
+                revised = true;
+            }
+        }
+    }
+
+    // 4. 收尾（reconcile bible）
+    let mut reconcile_note = None;
+    let auto_reconcile = args.auto_reconcile.unwrap_or(true);
+    if auto_reconcile {
+        let rec_res = ai_reconcile_bible(AiReconcileBibleArgs {
+            root: args.root.clone(),
+            chapter_file: Some(chapter_file.clone()),
+            decision: None,
+            session_id: session_id.clone(),
+            timeout_secs: Some(timeout.min(180)),
+            port: Some(port),
+        })?;
+        if let Some(sid) = rec_res.session_id.as_ref() {
+            session_id = Some(sid.clone());
+        }
+        reconcile_note = Some(if rec_res.ok {
+            rec_res.error.unwrap_or_else(|| "圣经已同步".into())
+        } else {
+            format!("reconcile 未完成：{}", rec_res.error.unwrap_or_default())
+        });
+    }
+
+    // 5. git 提交（防丢）
+    let _ = git_commit_novel(&PathBuf::from(&args.root), &chapter_file, revised);
+
+    Ok(AiFullPipelineResult {
+        ok: true,
+        stage: if revised { "done_revised".into() } else { "done".into() },
+        chapter_file: Some(chapter_file.clone()),
+        review_summary: Some(review_summary),
+        verdict: Some(verdict.clone()),
+        final_text: Some(final_text),
+        reconcile_note,
+        session_id,
+        error: None,
+    })
+}
+
+/// 在小说项目里执行 git add + commit（防丢）。项目可能没 git init → 静默跳过。
+fn git_commit_novel(root: &Path, chapter_file: &str, revised: bool) -> Result<(), String> {
+    use std::process::Command;
+
+    // 确认 .git 存在，否则跳过
+    if !root.join(".git").exists() {
+        return Ok(());
+    }
+    let action = if revised { "修订" } else { "新增" };
+    let out = Command::new("git")
+        .args(["-C", root.to_str().unwrap_or("."), "add", "-A"])
+        .output()
+        .map_err(|e| format!("git add 失败: {e}"))?;
+    if !out.status.success() {
+        return Ok(()); // add 失败不致命
+    }
+    let _ = Command::new("git")
+        .args(["-C", root.to_str().unwrap_or("."), "commit", "-m", &format!("ch: {action} {chapter_file}")])
+        .output();
+    Ok(())
 }
 
 /// 解析 `### FILE: <path>\n<content>\n### END` 块
@@ -2390,6 +2600,7 @@ pub fn run() {
             ai_reconcile_bible,
             ai_review_chapter,
             ai_revise_chapter,
+            ai_full_pipeline,
             read_story_spine
         ])
         .run(tauri::generate_context!())
@@ -2750,6 +2961,38 @@ mod tests {
         assert_eq!(a_issues.len(), 1);
         assert_eq!(a_issues[0]["severity"], "major");
         assert_eq!(cats["C"]["issues"][0]["issue"].as_str().unwrap().contains("密语"), true);
+    }
+
+    /// 端到端：一键流水线（写→审→改→收尾）。需要 dsh web。默认 #[ignore]。
+    /// 谨慎运行：会真实写入新章节 + 修改 bible。用短指令控制篇幅。
+    #[test]
+    #[ignore]
+    fn e2e_ai_full_pipeline() {
+        let p = "/Users/zhouluyong/Documents/我的小说";
+        let path = std::path::Path::new(p);
+        if !path.join("state.yml").exists() || !path.join("bible").is_dir() {
+            eprintln!("skipped — 项目根未就绪");
+            return;
+        }
+        // 用"写序章测试篇"避免推进主线
+        let res = ai_full_pipeline(AiFullPipelineArgs {
+            root: p.to_string(),
+            instruction: Some("写一章序章测试（约300-500字即可，测试用短章）。不要推进主线剧情，只写环境与人物速写。".to_string()),
+            auto_revise: Some(true),
+            auto_reconcile: Some(true),
+            session_id: None,
+            timeout_secs: Some(600),
+            port: Some(3080),
+        })
+        .expect("pipeline call");
+        eprintln!("stage={} ok={}", res.stage, res.ok);
+        eprintln!("chapter={:?} verdict={:?}", res.chapter_file, res.verdict);
+        eprintln!("summary={:?}", res.review_summary);
+        eprintln!("reconcile={:?}", res.reconcile_note);
+        eprintln!("final_text_len={}", res.final_text.as_ref().map(|t| t.chars().count()).unwrap_or(0));
+        if let Some(err) = &res.error {
+            eprintln!("error={err}");
+        }
     }
 
     /// 端到端：AI 审核最近一章。需要 dsh web。默认 #[ignore]。

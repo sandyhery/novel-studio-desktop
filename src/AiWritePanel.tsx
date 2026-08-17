@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { AiReconcileBibleResult, AiWriteChapterResult } from "./types";
+import type { AiFullPipelineResult, AiReconcileBibleResult, AiWriteChapterResult } from "./types";
 import ChoiceModal, { type ChoiceRequest } from "./ChoiceModal";
 
 interface AiWritePanelProps {
@@ -28,6 +28,8 @@ export default function AiWritePanel({
   const [error, setError] = useState<string | null>(null);
   const [reconciling, setReconciling] = useState(false);
   const [reconcileOutcome, setReconcileOutcome] = useState<string | null>(null);
+  const [pipelineRunning, setPipelineRunning] = useState(false);
+  const [pipelineResult, setPipelineResult] = useState<AiFullPipelineResult | null>(null);
 
   const startWrite = useCallback(async () => {
     setError(null);
@@ -137,6 +139,46 @@ export default function AiWritePanel({
     }
   }, [result, root, sessionId, onSessionId]);
 
+  const runPipeline = useCallback(async () => {
+    setError(null);
+    setResult(null);
+    setPipelineResult(null);
+    setPipelineRunning(true);
+    setProgress("🚀 一键流水线：写 → 审 → 改 → 收尾…（全程约 3-6 分钟）");
+    try {
+      const res = await invoke<AiFullPipelineResult>("ai_full_pipeline", {
+        args: {
+          root,
+          instruction: instruction.trim() || null,
+          autoRevise: true,
+          autoReconcile: true,
+          sessionId: sessionId ?? null,
+          timeoutSecs: 900,
+        },
+      });
+      if (res.sessionId) onSessionId?.(res.sessionId);
+      setPipelineResult(res);
+      if (!res.ok) {
+        setError(res.error ?? "流水线中断");
+        if (res.stage === "choice_pending") {
+          setProgress("写作遇到抉择点，请先到上面手动处理");
+          onSaved?.();
+        }
+        return;
+      }
+      setProgress(
+        res.stage === "done_revised"
+          ? `✅ 完成：${res.chapterFile} 已写、已审、已修订、已收尾`
+          : `✅ 完成：${res.chapterFile} 已写、已审（verdict=${res.verdict}）、已收尾`,
+      );
+      onSaved?.();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPipelineRunning(false);
+    }
+  }, [root, instruction, sessionId, onSessionId, onSaved]);
+
   return (
     <div className="panel">
       <h2 className="section-title">✨ AI 写章节</h2>
@@ -159,15 +201,48 @@ export default function AiWritePanel({
         <div className="spacer" />
         <button
           className="btn primary"
-          onClick={startWrite}
-          disabled={phase === "running" || phase === "choice"}
+          onClick={runPipeline}
+          disabled={pipelineRunning || phase === "running" || phase === "choice"}
         >
-          {phase === "running" ? "AI 写作中…" : "🚀 让 AI 写章节"}
+          {pipelineRunning ? "流水线运行中…" : "⚡ 一键写→审→改→收尾"}
+        </button>
+        <button
+          className="btn"
+          onClick={startWrite}
+          disabled={pipelineRunning || phase === "running" || phase === "choice"}
+        >
+          {phase === "running" ? "AI 写作中…" : "🚀 只写章节"}
         </button>
       </div>
 
       {progress && <p className="muted small">{progress}</p>}
       {error && <div className="error-banner">{error}</div>}
+
+      {pipelineResult && pipelineResult.ok && (
+        <div className="result-box">
+          <div className="result-head">
+            <span className="badge ok">流水线完成</span>
+            <span className="muted small">{pipelineResult.chapterFile}</span>
+          </div>
+          {pipelineResult.reviewSummary && (
+            <p className="review-summary-text">{pipelineResult.reviewSummary}</p>
+          )}
+          <div className="result-head" style={{ gap: 8 }}>
+            {pipelineResult.verdict && (
+              <span className={`badge ${pipelineResult.verdict === "pass" ? "ok" : "warn"}`}>
+                审核：{pipelineResult.verdict === "pass" ? "通过" : "已修订"}
+              </span>
+            )}
+            {pipelineResult.reconcileNote && (
+              <span className="muted small">{pipelineResult.reconcileNote}</span>
+            )}
+          </div>
+          <pre className="md">
+            {(pipelineResult.finalText ?? "").slice(0, 1200)}
+            {(pipelineResult.finalText?.length ?? 0) > 1200 ? "…（完整内容已存盘）" : ""}
+          </pre>
+        </div>
+      )}
 
       {result && phase === "done" && (
         <div className="result-box">
