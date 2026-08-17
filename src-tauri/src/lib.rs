@@ -1826,6 +1826,332 @@ fn append_character_change_note(existing: &str, note: &str) -> String {
     }
 }
 
+// ===========================================================================
+// AI 审核员 — 章节一致性审核（A/B/C/D/P 五类）
+// ===========================================================================
+//
+// 让一个 agent 以"连续性守门员"身份读章节 + bible，产出结构化审核报告：
+//   A = 严重冲突（与已写事实矛盾、时间倒流、已死角色复活）
+//   B = 性格漂移（角色行为与档案不符）
+//   C = 信息差漏洞（POV 角色知道了他不该知道的）
+//   D = 伏笔推进（该埋没埋 / 该收没收 / 重复埋设）
+//   P = 节奏问题（头重脚轻、视角漂移、对白失衡）
+//
+// ===========================================================================
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReviewChapterArgs {
+    pub root: String,
+    /// 章节文件名（ch001.md 等）；缺省用最近一章
+    pub chapter_file: Option<String>,
+    pub session_id: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub port: Option<u16>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewIssue {
+    pub severity: String,      // "critical" | "major" | "minor" | "info"
+    pub location: String,      // 大致位置（章内第几段 / 原文引用）
+    pub issue: String,         // 问题描述
+    pub suggestion: String,    // 修订建议
+}
+
+#[derive(Serialize, Default, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCategory {
+    pub label: String,
+    pub issues: Vec<ReviewIssue>,
+}
+
+#[derive(Serialize, Default, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewReport {
+    pub ok: bool,
+    pub chapter_file: String,
+    pub summary: String,
+    /// verdict: "pass"（无重大冲突）| "revise"（需要修订）
+    pub verdict: String,
+    pub categories: std::collections::HashMap<String, ReviewCategory>,
+    pub session_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 让 AI 审核最近一章（或指定章节）。
+#[tauri::command]
+fn ai_review_chapter(args: AiReviewChapterArgs) -> Result<ReviewReport, String> {
+    use dsh_client as dsh;
+
+    let start = PathBuf::from(&args.root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let port = args.port.unwrap_or(dsh::default_port());
+    let timeout = args.timeout_secs.unwrap_or(240);
+
+    if !dsh::ping(port) {
+        return Ok(ReviewReport {
+            ok: false,
+            error: Some(format!("DSH Web 服务未运行（127.0.0.1:{port}）。请先启动 dsh web。")),
+            ..Default::default()
+        });
+    }
+
+    // 确定章节文件
+    let chapter_file = if let Some(f) = &args.chapter_file {
+        f.clone()
+    } else {
+        let mut files: Vec<String> = fs::read_dir(novel_root.join("chapters"))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|f| f.ends_with(".md"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files.pop().ok_or_else(|| "chapters/ 里没有章节可审".to_string())?
+    };
+    let chapter_text = fs::read_to_string(novel_root.join("chapters").join(&chapter_file))
+        .map_err(|e| format!("读章节失败: {e}"))?;
+
+    // 收集 bible 上下文（精简）
+    let mut bible_ctx = String::new();
+    let bible_dir = novel_root.join("bible");
+    if let Ok(entries) = fs::read_dir(&bible_dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".md") && name != "world-rules.md" {
+                if let Ok(text) = fs::read_to_string(e.path()) {
+                    let head: String = text.chars().take(1200).collect();
+                    bible_ctx.push_str(&format!("\n### {name}\n{head}\n"));
+                }
+            }
+            if e.path().is_dir() && name == "characters" {
+                if let Ok(chars) = fs::read_dir(e.path()) {
+                    for c in chars.flatten() {
+                        let cname = c.file_name().to_string_lossy().to_string();
+                        if cname.ends_with(".md") {
+                            if let Ok(text) = fs::read_to_string(c.path()) {
+                                let head: String = text.chars().take(700).collect();
+                                bible_ctx.push_str(&format!("\n#### 角色 {cname}\n{head}\n"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let prompt = format!(
+        "你是小说的连续性审核员（Continuity Auditor）。审核下面这章《{title}》的正文，对照现有世界圣经，找出连续性 / 信息差 / 伏笔 / 节奏问题。\n\
+         \n\
+         ## 五类问题（严格按此分类）\n\
+         - A 严重冲突：与已写事实矛盾（时间倒流、已死角色复活、地点/阵营错乱、年龄/季节漂移）\n\
+         - B 性格漂移：角色行为/说话方式与其档案不符\n\
+         - C 信息差漏洞：POV 角色知道了他不该知道的信息（超出其已知信息段）\n\
+         - D 伏笔推进：该埋的没埋、该收的没收、重复埋设同一伏笔\n\
+         - P 节奏问题：章节头重脚轻、视角漂移、对白失衡、章末钩子缺失\n\
+         \n\
+         ## 输出格式（严格 JSON，不要任何其他文字/围栏）\n\
+         {{\n\
+           \"summary\": \"一句话总结本章质量\",\n\
+           \"verdict\": \"pass\" 或 \"revise\",\n\
+           \"categories\": {{\n\
+             \"A\": {{\"label\": \"严重冲突\", \"issues\": [{{\"severity\": \"critical|major|minor|info\", \"location\": \"<章内位置>\", \"issue\": \"<问题>\", \"suggestion\": \"<修订建议>\"}}]}},\n\
+             \"B\": {{\"label\": \"性格漂移\", \"issues\": [...]}},\n\
+             \"C\": {{\"label\": \"信息差漏洞\", \"issues\": [...]}},\n\
+             \"D\": {{\"label\": \"伏笔推进\", \"issues\": [...]}},\n\
+             \"P\": {{\"label\": \"节奏问题\", \"issues\": [...]}}\n\
+           }}\n\
+         }}\n\
+         - 某类没问题就 issues: []。\n\
+         - severity 建议：致命逻辑错 critical；明显矛盾 major；可打磨 minor；提示 info。\n\
+         - 尽量具体（引用原文短句），suggestion 给出可操作的改法。\n\
+         \n\
+         ## 章节正文\n\
+         ```markdown\n{chapter}\n```\n\
+         \n\
+         ## 世界圣经摘要\n\
+         {bible}\n\
+         \n\
+         ## 上一章钩子（state.yml next_hook，若有）\n\
+         {next_hook}",
+        title = read_state(&novel_root).title,
+        chapter = if chapter_text.chars().count() > 5000 {
+            chapter_text.chars().take(5000).collect::<String>()
+        } else {
+            chapter_text.clone()
+        },
+        bible = if bible_ctx.chars().count() > 4000 {
+            bible_ctx.chars().take(4000).collect::<String>()
+        } else {
+            bible_ctx
+        },
+        next_hook = read_state(&novel_root).next_hook,
+    );
+
+    let sid = dsh::session_create(
+        &novel_root.to_string_lossy(),
+        args.session_id.as_deref(),
+        Some("standard"),
+        port,
+    )
+    .map_err(|e| format!("创建 DSH 会话失败：{e}"))?;
+    dsh::session_prompt(&sid, &prompt, "queue", port).map_err(|e| format!("提交指令失败：{e}"))?;
+    let outcome = dsh::wait_for_assistant(&sid, port, timeout).map_err(|e| e.to_string())?;
+
+    // 解析 JSON 报告
+    let json_str = extract_json_object(&outcome.text);
+    let parsed: Option<Value> = json_str.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let mut report = ReviewReport {
+        ok: true,
+        chapter_file,
+        summary: String::new(),
+        verdict: "revise".into(),
+        categories: Default::default(),
+        session_id: Some(sid.clone()),
+        error: None,
+    };
+
+    match parsed {
+        Some(v) => {
+            report.summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            report.verdict = v.get("verdict").and_then(|s| s.as_str()).unwrap_or("revise").to_string();
+            if let Some(cats) = v.get("categories").and_then(|c| c.as_object()) {
+                for (key, cat) in cats {
+                    let label = cat.get("label").and_then(|l| l.as_str()).unwrap_or(key).to_string();
+                    let mut issues = Vec::new();
+                    if let Some(iss) = cat.get("issues").and_then(|i| i.as_array()) {
+                        for it in iss {
+                            issues.push(ReviewIssue {
+                                severity: it.get("severity").and_then(|s| s.as_str()).unwrap_or("minor").to_string(),
+                                location: it.get("location").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                                issue: it.get("issue").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                                suggestion: it.get("suggestion").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            });
+                        }
+                    }
+                    report.categories.insert(key.clone(), ReviewCategory { label, issues });
+                }
+            }
+        }
+        None => {
+            report.error = Some("agent 未输出合法 JSON 审核报告".into());
+        }
+    }
+
+    Ok(report)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReviseChapterArgs {
+    pub root: String,
+    pub chapter_file: String,
+    /// 审核报告的 categories（前端把已有报告透传回来），或让 agent 重读
+    pub report_json: Option<String>,
+    pub session_id: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub port: Option<u16>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReviseChapterResult {
+    pub ok: bool,
+    pub revised_text: String,
+    pub saved_to: Option<String>,
+    pub session_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 基于审核报告修订章节，生成 v2 并覆盖写回（保留原版为 .bak）。
+#[tauri::command]
+fn ai_revise_chapter(args: AiReviseChapterArgs) -> Result<AiReviseChapterResult, String> {
+    use dsh_client as dsh;
+
+    let start = PathBuf::from(&args.root);
+    let novel_root = find_novel_root(&start)
+        .ok_or_else(|| format!("未找到小说项目（{}）", start.display()))?;
+    let port = args.port.unwrap_or(dsh::default_port());
+    let timeout = args.timeout_secs.unwrap_or(240);
+
+    if !dsh::ping(port) {
+        return Ok(AiReviseChapterResult {
+            ok: false,
+            error: Some(format!("DSH Web 服务未运行（127.0.0.1:{port}）。请先启动 dsh web。")),
+            ..Default::default()
+        });
+    }
+
+    let chapter_path = novel_root.join("chapters").join(&args.chapter_file);
+    let chapter_text = fs::read_to_string(&chapter_path)
+        .map_err(|e| format!("读章节失败: {e}"))?;
+
+    let report_text = args.report_json.clone().unwrap_or_default();
+
+    let prompt = format!(
+        "你是一位经验丰富的网文修订编辑。根据审核报告，修订下面的章节，生成修订版 v2。\n\
+         \n\
+         ## 修订原则\n\
+         - 修复所有 A/B/C 类问题（严重冲突 / 性格漂移 / 信息差）；D/P 类酌情处理。\n\
+         - 保持原章的叙事节奏、文风、伏笔走向；不要为了改而改。\n\
+         - 只输出修订后的完整章节 markdown（以 # 开头），不要输出任何说明文字。\n\
+         \n\
+         ## 审核报告（JSON）\n\
+         {report}\n\
+         \n\
+         ## 原章节正文\n\
+         ```markdown\n{chapter}\n```",
+        report = if report_text.chars().count() > 3000 { report_text.chars().take(3000).collect::<String>() } else { report_text },
+        chapter = if chapter_text.chars().count() > 6000 { chapter_text.chars().take(6000).collect::<String>() } else { chapter_text.clone() },
+    );
+
+    let sid = dsh::session_create(
+        &novel_root.to_string_lossy(),
+        args.session_id.as_deref(),
+        Some("standard"),
+        port,
+    )
+    .map_err(|e| format!("创建 DSH 会话失败：{e}"))?;
+    dsh::session_prompt(&sid, &prompt, "queue", port).map_err(|e| format!("提交指令失败：{e}"))?;
+    let outcome = dsh::wait_for_assistant(&sid, port, timeout).map_err(|e| e.to_string())?;
+
+    let revised = extract_markdown_body(&outcome.text);
+    if revised.trim().is_empty() {
+        return Ok(AiReviseChapterResult {
+            ok: false,
+            error: Some("agent 没有输出修订正文".into()),
+            session_id: Some(sid),
+            ..Default::default()
+        });
+    }
+
+    // 备份原版 → .bak，然后覆盖写回
+    let bak_path = chapter_path.with_extension("md.bak");
+    let _ = fs::write(&bak_path, chapter_text.as_bytes());
+    if fs::write(&chapter_path, revised.as_bytes()).is_err() {
+        // 写失败尝试恢复
+        let _ = fs::write(&chapter_path, chapter_text.as_bytes());
+        return Ok(AiReviseChapterResult {
+            ok: false,
+            error: Some("写入修订版失败".into()),
+            session_id: Some(sid),
+            ..Default::default()
+        });
+    }
+
+    Ok(AiReviseChapterResult {
+        ok: true,
+        revised_text: revised.clone(),
+        saved_to: Some(args.chapter_file.clone()),
+        session_id: Some(sid),
+        error: None,
+    })
+}
+
 /// 解析 `### FILE: <path>\n<content>\n### END` 块
 fn split_file_blocks(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -2062,6 +2388,8 @@ pub fn run() {
             seed_demo_choice_points,
             ai_write_chapter,
             ai_reconcile_bible,
+            ai_review_chapter,
+            ai_revise_chapter,
             read_story_spine
         ])
         .run(tauri::generate_context!())
@@ -2397,6 +2725,55 @@ mod tests {
         // 清理 seed（保持目录干净）
         let _ = fs::remove_dir_all(path.join(".ai-novel"));
         eprintln!("(清理 .ai-novel)");
+    }
+
+    /// 审核报告 JSON 解析（用真实 agent 输出格式的样本）。
+    #[test]
+    fn review_report_parse_sample() {
+        let sample = r#"{
+  "summary": "本章整体流畅，但有 2 处需要注意",
+  "verdict": "revise",
+  "categories": {
+    "A": {"label": "严重冲突", "issues": [{"severity": "major", "location": "第 3 段", "issue": "李四已经死了但本章又登场", "suggestion": "改回他活着的时间线"}]},
+    "B": {"label": "性格漂移", "issues": []},
+    "C": {"label": "信息差漏洞", "issues": [{"severity": "info", "location": "对话段", "issue": "李四知道了北境魔宗的内部密语", "suggestion": "让对话由魔宗内应说出"}]},
+    "D": {"label": "伏笔推进", "issues": []},
+    "P": {"label": "节奏问题", "issues": [{"severity": "minor", "location": "章末", "issue": "钩子较弱", "suggestion": "末尾加一句危机预告"}]}
+  }
+}"#;
+        let json_str = extract_json_object(sample).expect("extract json");
+        let v: Value = serde_json::from_str(&json_str).expect("parse");
+        assert_eq!(v["verdict"], "revise");
+        let cats = v["categories"].as_object().expect("categories object");
+        assert!(cats.contains_key("A") && cats.contains_key("B"));
+        let a_issues = cats["A"]["issues"].as_array().expect("A issues");
+        assert_eq!(a_issues.len(), 1);
+        assert_eq!(a_issues[0]["severity"], "major");
+        assert_eq!(cats["C"]["issues"][0]["issue"].as_str().unwrap().contains("密语"), true);
+    }
+
+    /// 端到端：AI 审核最近一章。需要 dsh web。默认 #[ignore]。
+    #[test]
+    #[ignore]
+    fn e2e_ai_review_chapter() {
+        let p = "/Users/zhouluyong/Documents/我的小说";
+        let path = std::path::Path::new(p);
+        if !path.join("state.yml").exists() || !path.join("bible").is_dir() {
+            eprintln!("skipped — 项目根未就绪");
+            return;
+        }
+        let report = ai_review_chapter(AiReviewChapterArgs {
+            root: p.to_string(),
+            chapter_file: None,
+            session_id: None,
+            timeout_secs: Some(240),
+            port: Some(3080),
+        })
+        .expect("review call");
+        eprintln!("verdict={} summary={}", report.verdict, report.summary);
+        for (key, cat) in &report.categories {
+            eprintln!("  [{key}] {} issues={}", cat.label, cat.issues.len());
+        }
     }
 
     /// 端到端：AI 收尾三件事（同步圣经）。需要 dsh web。默认 #[ignore]。

@@ -6,8 +6,9 @@ import { fmtChars, fmtDate } from "./types";
 import CreateNovelModal from "./CreateNovelModal";
 import StoryboardPanel from "./StoryboardPanel";
 import AiWritePanel from "./AiWritePanel";
+import ReviewPanel from "./ReviewPanel";
 
-type Panel = "overview" | "chapters" | "bible" | "editor" | "storyboard" | "aiwrite";
+type Panel = "overview" | "chapters" | "bible" | "editor" | "storyboard" | "aiwrite" | "review";
 
 interface BibleSelection {
   /** "timeline" / "foreshadowing" / "characters/林楚" 这种带不带路径的 key */
@@ -225,6 +226,14 @@ export default function App() {
             <span className="nav-icon">🤖</span>
             <span>AI 写章节</span>
           </button>
+          <button
+            className={`nav-item ${panel === "review" ? "active" : ""}`}
+            onClick={() => setPanel("review")}
+            disabled={!summary}
+          >
+            <span className="nav-icon">🛡️</span>
+            <span>AI 审核</span>
+          </button>
 
           {summary && (
             <div className="section">
@@ -350,6 +359,15 @@ export default function App() {
 
           {summary && panel === "aiwrite" && (
             <AiWritePanel
+              root={summary.root}
+              sessionId={dshSessionId}
+              onSessionId={setDshSessionId}
+              onSaved={() => loadSummary(summary.root)}
+            />
+          )}
+
+          {summary && panel === "review" && (
+            <ReviewPanel
               root={summary.root}
               sessionId={dshSessionId}
               onSessionId={setDshSessionId}

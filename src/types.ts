@@ -249,3 +249,57 @@ export interface StorySpine {
   nodes: SpineNode[];
   branches: Array<[string, SpineNode[]]>;
 }
+
+// ---------------------------------------------------------------------------
+// AI 审核员
+// ---------------------------------------------------------------------------
+
+export interface ReviewIssue {
+  severity: "critical" | "major" | "minor" | "info";
+  location: string;
+  issue: string;
+  suggestion: string;
+}
+
+export interface ReviewCategory {
+  label: string;
+  issues: ReviewIssue[];
+}
+
+export interface ReviewReport {
+  ok: boolean;
+  chapterFile: string;
+  summary: string;
+  verdict: "pass" | "revise";
+  categories: Record<string, ReviewCategory>;
+  sessionId: string | null;
+  error: string | null;
+}
+
+export interface AiReviewChapterArgs {
+  root: string;
+  chapterFile?: string | null;
+  sessionId?: string | null;
+  timeoutSecs?: number;
+  port?: number;
+}
+
+export interface AiReviseChapterArgs {
+  root: string;
+  chapterFile: string;
+  reportJson?: string | null;
+  sessionId?: string | null;
+  timeoutSecs?: number;
+  port?: number;
+}
+
+export interface AiReviseChapterResult {
+  ok: boolean;
+  revisedText: string;
+  savedTo: string | null;
+  sessionId: string | null;
+  error: string | null;
+}
+
+/** 审核问题类别顺序 */
+export const REVIEW_CATEGORY_ORDER = ["A", "B", "C", "D", "P"] as const;
