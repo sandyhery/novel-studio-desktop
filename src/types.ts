@@ -30,6 +30,8 @@ export interface NovelState {
   pov: string;
   nextHook: string;
   foreshadowingOpen: number;
+  /** 单章建议字数目标（0 = 未知，不显示达标 banner） */
+  chapterTargetWords: number;
 }
 
 export interface NovelSummary {

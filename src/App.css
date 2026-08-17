@@ -1023,3 +1023,122 @@ code {
   color: var(--muted);
   line-height: 1.55;
 }
+
+/* ---------- 编辑器：字体/行距/阅读模式/沉浸/字数目标 ---------- */
+
+.ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ctl select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+  font-size: 12px;
+}
+.ctl select:focus { outline: none; border-color: var(--accent); }
+
+.goal-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.goal-banner.reached {
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  border-color: var(--success);
+  background: rgba(63, 185, 80, 0.08);
+}
+.goal-icon { font-size: 18px; line-height: 1; }
+.goal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.goal-title { font-weight: 600; font-size: 13px; }
+.goal-remain { margin-left: auto; }
+.goal-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.goal-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.goal-banner.reached .goal-fill { background: var(--success); }
+.goal-foot { text-align: right; }
+
+/* 阅读视图（Markdown 渲染成排版正文） */
+.md-view {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 26px;
+  font-family: ui-serif, "Songti SC", Georgia, serif;
+  min-height: 0;
+}
+.md-view-inner {
+  max-width: 46em;
+  margin: 0 auto;
+  color: var(--text);
+}
+.md-view-inner h1,
+.md-view-inner h2,
+.md-view-inner h3,
+.md-view-inner h4,
+.md-view-inner h5,
+.md-view-inner h6 {
+  line-height: inherit;
+  margin: 1.2em 0 0.5em;
+  font-weight: 700;
+}
+.md-view-inner h1 {
+  font-size: 1.6em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+.md-view-inner h2 { font-size: 1.4em; }
+.md-view-inner h3 { font-size: 1.2em; }
+.md-view-inner h4 { font-size: 1.05em; }
+.md-view-inner p { margin: 0.8em 0; line-height: inherit; }
+.md-view-inner ul,
+.md-view-inner ol { margin: 0.6em 0; padding-left: 1.6em; line-height: inherit; }
+.md-view-inner li { margin: 0.2em 0; }
+.md-view-inner blockquote {
+  margin: 0.8em 0;
+  padding: 0.3em 1em;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+  background: var(--bg);
+}
+.md-view-inner hr { border: none; border-top: 1px solid var(--border); margin: 1.4em 0; }
+.md-view-inner code { background: var(--bg); }
+.md-view-inner del { opacity: 0.6; }
+
+/* 全屏沉浸层 */
+.immersive {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 18px;
+  background: var(--bg);
+  box-sizing: border-box;
+}
+.immersive .panel.editor {
+  flex: 1;
+  min-height: 0;
+}

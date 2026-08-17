@@ -84,6 +84,8 @@ pub struct NovelState {
     pub next_hook: String,
     /// 待回收伏笔条数
     pub foreshadowing_open: u64,
+    /// 单章建议字数目标（0 = 未知，不显示达标 banner）
+    pub chapter_target_words: u64,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -207,6 +209,9 @@ fn read_state(root: &Path) -> NovelState {
             "world_date" => state.world_date = v.to_string(),
             "pov" => state.pov = v.to_string(),
             "next_hook" => state.next_hook = v.to_string(),
+            "chapter_target_words" => {
+                state.chapter_target_words = v.parse().unwrap_or(0);
+            }
             _ => {}
         }
     }
@@ -216,7 +221,42 @@ fn read_state(root: &Path) -> NovelState {
             state.title = name.to_string();
         }
     }
+    // 兜底：单章字数目标 —— state.yml 没有时从 bible/world-rules.md 的「单章建议字数」解析
+    if state.chapter_target_words == 0 {
+        state.chapter_target_words = parse_chapter_target_from_world_rules(root);
+    }
     state
+}
+
+/// 从 bible/world-rules.md 解析「单章建议字数」行里的第一个数字（如「约 3000 字」→ 3000）。
+/// 找不到或读不到返回 0。
+fn parse_chapter_target_from_world_rules(root: &Path) -> u64 {
+    let path = root.join("bible").join("world-rules.md");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    for line in text.lines() {
+        if line.contains("单章建议字数") || line.contains("单章字数") {
+            if let Some(n) = first_number_in(line) {
+                return n;
+            }
+        }
+    }
+    0
+}
+
+/// 取一行里出现的第一个十进制整数（阿拉伯数字），没有则返回 None。
+fn first_number_in(s: &str) -> Option<u64> {
+    let mut digits = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse().ok()
 }
 
 fn char_count_zh(text: &str) -> u64 {
@@ -627,6 +667,11 @@ fn create_novel(args: CreateNovelArgs) -> Result<String, String> {
     // 1. 写 world-rules.md（题材 / 规模 / 第一幕冲突的固化文档）
     let total_chapters = args.volumes * args.chapters_per_volume;
     let target_words: u64 = u64::from(args.target_words_wan) * 10_000;
+    let per_chapter: u64 = if total_chapters > 0 {
+        target_words / u64::from(total_chapters)
+    } else {
+        0
+    };
     let world_rules = format!(
         "# 世界规则（题材与规模定稿）\n\n\
          > 一旦写下即为定稿，正文引用本文件，不要在正文里另造。\n\n\
@@ -660,11 +705,7 @@ fn create_novel(args: CreateNovelArgs) -> Result<String, String> {
         volumes = args.volumes,
         total_ch = total_chapters,
         cpv = args.chapters_per_volume,
-        per_ch = if total_chapters > 0 {
-            target_words / u64::from(total_chapters)
-        } else {
-            0
-        },
+        per_ch = per_chapter,
         pov_mode = args.pov_mode,
         pov_character = if args.pov_character.is_empty() {
             "（多重视角）".to_string()
@@ -694,6 +735,7 @@ fn create_novel(args: CreateNovelArgs) -> Result<String, String> {
            - \"ch0: 大纲/设定\"\n\
          blocked: []               # 卡点\n\
          foreshadowing_open: 1     # 开篇埋伏笔 F001（见 bible/foreshadowing.md）\n\
+         chapter_target_words: {per_chapter}   # 单章建议字数（编辑器达标 banner 用）\n\
          updated: \"{today}\"\n",
         title = args.title,
         era = args.era,
@@ -703,6 +745,7 @@ fn create_novel(args: CreateNovelArgs) -> Result<String, String> {
             args.pov_character.clone()
         },
         opening_hook = args.opening_hook,
+        per_chapter = per_chapter,
         today = today,
     );
     fs::write(project_dir.join("state.yml"), state_content.as_bytes())

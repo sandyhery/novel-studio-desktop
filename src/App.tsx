@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { BibleMeta, Chapter, NovelState, NovelSummary, Probe } from "./types";
 import { fmtChars, fmtDate } from "./types";
@@ -7,6 +8,7 @@ import CreateNovelModal from "./CreateNovelModal";
 import StoryboardPanel from "./StoryboardPanel";
 import AiWritePanel from "./AiWritePanel";
 import ReviewPanel from "./ReviewPanel";
+import MarkdownView from "./MarkdownView";
 
 type Panel = "overview" | "chapters" | "bible" | "editor" | "storyboard" | "aiwrite" | "review";
 
@@ -14,6 +16,16 @@ interface BibleSelection {
   /** "timeline" / "foreshadowing" / "characters/林楚" 这种带不带路径的 key */
   file: string;
   display: string;
+}
+
+/** 从 localStorage 读一个数值型偏好，越界/损坏时退回默认值。 */
+function readPrefNumber(key: string, fallback: number, min: number, max: number): number {
+  try {
+    const v = Number(localStorage.getItem(key));
+    return Number.isFinite(v) && v >= min && v <= max ? v : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export default function App() {
@@ -34,6 +46,30 @@ export default function App() {
   const [probe, setProbe] = useState<Probe | null>(null);
   const [probeFor, setProbeFor] = useState<string | null>(null);
   const [briefInit, setBriefInit] = useState<{ parent?: string | null; name?: string } | null>(null);
+  const [readMode, setReadMode] = useState(false);
+  const [immersed, setImmersed] = useState(false);
+  const [fontSize, setFontSize] = useState<number>(() => readPrefNumber("novelStudio.fontSize", 16, 12, 32));
+  const [lineHeight, setLineHeight] = useState<number>(() => readPrefNumber("novelStudio.lineHeight", 1.85, 1.2, 3));
+
+  const changeFontSize = useCallback((n: number) => {
+    setFontSize(n);
+    try { localStorage.setItem("novelStudio.fontSize", String(n)); } catch { /* ignore */ }
+  }, []);
+
+  const changeLineHeight = useCallback((n: number) => {
+    setLineHeight(n);
+    try { localStorage.setItem("novelStudio.lineHeight", String(n)); } catch { /* ignore */ }
+  }, []);
+
+  const toggleImmerse = useCallback(async () => {
+    const next = !immersed;
+    setImmersed(next);
+    try {
+      await getCurrentWindow().setFullscreen(next);
+    } catch {
+      // OS 全屏失败也不影响：CSS 沉浸层仍会隐藏顶部/侧栏
+    }
+  }, [immersed]);
 
   const runProbe = useCallback(async (path: string) => {
     try {
@@ -144,6 +180,35 @@ export default function App() {
     () => summary?.chapters.reduce((sum, c) => sum + c.chars, 0) ?? 0,
     [summary],
   );
+
+  const targetWords = summary?.state.chapterTargetWords ?? 0;
+
+  const editorPanel = (
+    <EditorPanel
+      chapter={editingChapter}
+      draft={chapterDraft}
+      saved={chapterSaved}
+      saving={saving}
+      onChange={(v) => {
+        setChapterDraft(v);
+        setChapterSaved(false);
+      }}
+      onSave={saveChapter}
+      readMode={readMode}
+      onToggleReadMode={() => setReadMode((v) => !v)}
+      immersed={immersed}
+      onToggleImmerse={toggleImmerse}
+      fontSize={fontSize}
+      onFontSize={changeFontSize}
+      lineHeight={lineHeight}
+      onLineHeight={changeLineHeight}
+      targetWords={targetWords}
+    />
+  );
+
+  if (immersed && editingChapter) {
+    return <div className="immersive">{editorPanel}</div>;
+  }
 
   return (
     <div className="app">
@@ -375,19 +440,7 @@ export default function App() {
             />
           )}
 
-          {summary && panel === "editor" && (
-            <EditorPanel
-              chapter={editingChapter}
-              draft={chapterDraft}
-              saved={chapterSaved}
-              saving={saving}
-              onChange={(v) => {
-                setChapterDraft(v);
-                setChapterSaved(false);
-              }}
-              onSave={saveChapter}
-            />
-          )}
+          {summary && panel === "editor" && editorPanel}
         </main>
       </div>
 
@@ -682,6 +735,15 @@ function EditorPanel(props: {
   saving: boolean;
   onChange: (v: string) => void;
   onSave: () => void;
+  readMode: boolean;
+  onToggleReadMode: () => void;
+  immersed: boolean;
+  onToggleImmerse: () => void;
+  fontSize: number;
+  onFontSize: (n: number) => void;
+  lineHeight: number;
+  onLineHeight: (n: number) => void;
+  targetWords: number;
 }) {
   if (!props.chapter) {
     return (
@@ -691,14 +753,61 @@ function EditorPanel(props: {
     );
   }
   const wordCount = props.draft.replace(/\s/g, "").length;
+  const goal = props.targetWords;
+  const reached = goal > 0 && wordCount >= goal;
+  const ratio = goal > 0 ? Math.min(wordCount / goal, 1) : 0;
+  const remain = goal > 0 ? Math.max(goal - wordCount, 0) : 0;
+
   return (
     <div className="panel editor">
       <div className="editor-toolbar">
         <div>
           <div className="editor-title">{props.chapter.title}</div>
-          <div className="muted small">{props.chapter.file} · {fmtChars(wordCount)} 字</div>
+          <div className="muted small">
+            {props.chapter.file} · {fmtChars(wordCount)} 字
+            {goal > 0 && ` / 目标 ${fmtChars(goal)} 字`}
+          </div>
         </div>
         <div className="spacer" />
+        <label className="ctl">
+          <span className="muted small">字号</span>
+          <select
+            value={props.fontSize}
+            onChange={(e) => props.onFontSize(Number(e.target.value))}
+          >
+            <option value={14}>小 14</option>
+            <option value={16}>中 16</option>
+            <option value={18}>大 18</option>
+            <option value={20}>加大 20</option>
+            <option value={22}>特大 22</option>
+          </select>
+        </label>
+        <label className="ctl">
+          <span className="muted small">行距</span>
+          <select
+            value={props.lineHeight}
+            onChange={(e) => props.onLineHeight(Number(e.target.value))}
+          >
+            <option value={1.6}>紧凑</option>
+            <option value={1.85}>标准</option>
+            <option value={2.2}>宽松</option>
+            <option value={2.6}>极宽</option>
+          </select>
+        </label>
+        <button
+          className={`btn ${props.readMode ? "primary" : ""}`}
+          onClick={props.onToggleReadMode}
+          title="阅读模式：把 Markdown 渲染成排版正文"
+        >
+          {props.readMode ? "✏️ 编辑" : "📖 阅读"}
+        </button>
+        <button
+          className="btn"
+          onClick={props.onToggleImmerse}
+          title={props.immersed ? "退出全屏沉浸" : "全屏沉浸：隐藏界面、专注本章"}
+        >
+          {props.immersed ? "⤢ 退出沉浸" : "⛶ 沉浸"}
+        </button>
         <span className={`badge ${props.saved ? "ok" : "warn"}`}>
           {props.saving ? "保存中…" : props.saved ? "已保存" : "有未保存的修改"}
         </span>
@@ -710,12 +819,64 @@ function EditorPanel(props: {
           保存
         </button>
       </div>
-      <textarea
-        className="md-editor"
-        value={props.draft}
-        onChange={(e) => props.onChange(e.target.value)}
-        spellCheck={false}
-      />
+
+      {goal > 0 && (
+        <WordGoalBanner wordCount={wordCount} goal={goal} reached={reached} ratio={ratio} remain={remain} />
+      )}
+
+      {props.readMode ? (
+        <div
+          className="md-view"
+          style={{ fontSize: props.fontSize, lineHeight: props.lineHeight }}
+        >
+          <MarkdownView text={props.draft} />
+        </div>
+      ) : (
+        <textarea
+          className="md-editor"
+          style={{ fontSize: props.fontSize, lineHeight: props.lineHeight }}
+          value={props.draft}
+          onChange={(e) => props.onChange(e.target.value)}
+          spellCheck={false}
+        />
+      )}
+    </div>
+  );
+}
+
+function WordGoalBanner(props: {
+  wordCount: number;
+  goal: number;
+  reached: boolean;
+  ratio: number;
+  remain: number;
+}) {
+  if (props.reached) {
+    return (
+      <div className="goal-banner reached">
+        <span className="goal-icon">🎉</span>
+        <div className="goal-text">
+          <div className="goal-title">已达成章节字数目标</div>
+          <div className="muted small">
+            {fmtChars(props.wordCount)} / {fmtChars(props.goal)} 字 —— 这一章可以收尾了
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="goal-banner">
+      <div className="goal-head">
+        <span className="goal-icon">🎯</span>
+        <span className="goal-title">字数目标</span>
+        <span className="muted small goal-remain">还差 {fmtChars(props.remain)} 字</span>
+      </div>
+      <div className="goal-track">
+        <div className="goal-fill" style={{ width: `${(props.ratio * 100).toFixed(1)}%` }} />
+      </div>
+      <div className="muted small goal-foot">
+        {fmtChars(props.wordCount)} / {fmtChars(props.goal)} 字 · {Math.round(props.ratio * 100)}%
+      </div>
     </div>
   );
 }
