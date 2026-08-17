@@ -9,5 +9,4 @@ dist/
 
 # Tauri build artifacts
 src-tauri/target/
-src-tauri/Cargo.lock
 src-tauri/gen/
