@@ -462,3 +462,186 @@ code {
   color: var(--text);
 }
 .md-editor:focus { outline: none; border-color: var(--accent); }
+
+/* ---------- modal ---------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  animation: fadein 0.18s ease;
+}
+@keyframes fadein {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.modal {
+  width: min(720px, calc(100vw - 40px));
+  max-height: calc(100vh - 60px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 16px 20px 8px;
+}
+.modal-header h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+.btn.ghost {
+  border-color: transparent;
+  background: transparent;
+  padding: 4px 8px;
+}
+.btn.ghost:hover {
+  background: var(--bg);
+}
+
+.stepper {
+  list-style: none;
+  display: flex;
+  gap: 8px;
+  margin: 0 20px 8px;
+  padding: 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+}
+.stepper li {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: default;
+  padding: 0 12px;
+  position: relative;
+  color: var(--muted);
+  font-size: 13px;
+}
+.stepper li + li::before {
+  content: "";
+  position: absolute;
+  left: -8px;
+  top: 50%;
+  width: 8px;
+  border-top: 1px dashed var(--border);
+}
+.stepper li.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+.stepper li.done {
+  color: var(--success);
+  cursor: pointer;
+}
+.stepper .step-dot {
+  width: 22px;
+  height: 22px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+.stepper li.done .step-dot {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+.stepper li.active .step-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.modal-body {
+  flex: 1;
+  padding: 16px 20px;
+  overflow-y: auto;
+}
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 10px 16px;
+  align-items: start;
+}
+.form-grid .label {
+  margin: 8px 0 0;
+  text-align: right;
+  color: var(--muted);
+  font-size: 12px;
+  align-self: start;
+}
+.form-grid .search,
+.form-grid select,
+.form-grid .md-editor.small {
+  width: 100%;
+}
+.form-grid .md-editor.small {
+  min-height: 60px;
+  max-height: 160px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.form-row {
+  display: flex;
+  gap: 8px;
+}
+.form-row .search {
+  flex: 1;
+}
+.form-hint {
+  grid-column: 2;
+  margin: -4px 0 4px;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.metric.hero {
+  grid-column: 2;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip {
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.chip:hover { background: var(--bg-elev); }
+.chip.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}

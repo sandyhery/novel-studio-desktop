@@ -52,3 +52,62 @@ export function fmtDate(ms: number): string {
   if (!ms) return "—";
   return new Date(ms).toLocaleString();
 }
+
+// ---------------------------------------------------------------------------
+// 新建小说向导（4 步表单）
+// ---------------------------------------------------------------------------
+
+export type Genre =
+  | "玄幻"
+  | "都市"
+  | "科幻"
+  | "言情"
+  | "历史"
+  | "悬疑"
+  | "武侠"
+  | "其他";
+
+export type Tone = "轻松" | "严肃" | "黑暗" | "爽文" | "治愈";
+
+export const GENRES: Genre[] = ["玄幻", "都市", "科幻", "言情", "历史", "悬疑", "武侠", "其他"];
+export const TONES: Tone[] = ["轻松", "严肃", "黑暗", "爽文", "治愈"];
+export const POV_MODES = ["第一人称", "第三人称", "多重视角"] as const;
+export type PovMode = (typeof POV_MODES)[number];
+
+export interface NovelBrief {
+  parent: string;          // 父目录
+  name: string;            // 目录名
+  title: string;           // 标题
+  povMode: PovMode;
+  povCharacter: string;
+  genre: Genre;
+  tone: Tone;
+  era: string;             // "架空" / "现代" / "未来 2187" / "唐贞观" / 自填
+  targetWordsWan: number;  // 万字
+  volumes: number;
+  chaptersPerVolume: number;
+  coreConflict: string;    // 一句话核心矛盾
+  heroSituation: string;   // 一句话主角处境
+  heroDesire: string;      // 一句话主角欲望
+  openingHook: string;     // 一句话第一幕核心冲突
+}
+
+export function presetEras(): string[] {
+  return ["架空", "现代都市", "近未来", "远古", "中世纪", "唐贞观", "宋汴京", "清末民初", "民国"];
+}
+
+export function deriveProjectName(title: string): string {
+  // 让目录名安全：去标点 / 空格 → 下划线，纯 ASCII/中文保留
+  const cleaned = title
+    .trim()
+    .replace(/[\\\/:*?"<>|]/g, "")
+    .replace(/\s+/g, "-");
+  return cleaned || "未命名小说";
+}
+
+export function deriveSingleChapterWords(brief: NovelBrief): number {
+  const totalWords = brief.targetWordsWan * 10_000;
+  const totalChapters = brief.volumes * brief.chaptersPerVolume;
+  if (totalChapters <= 0) return 0;
+  return Math.round(totalWords / totalChapters);
+}

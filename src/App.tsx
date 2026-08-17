@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { BibleMeta, Chapter, NovelState, NovelSummary } from "./types";
 import { fmtChars, fmtDate } from "./types";
+import CreateNovelModal from "./CreateNovelModal";
 
 type Panel = "overview" | "chapters" | "bible" | "editor";
 
@@ -25,6 +26,7 @@ export default function App() {
   const [chapterDraft, setChapterDraft] = useState<string>("");
   const [chapterSaved, setChapterSaved] = useState<boolean>(true);
   const [saving, setSaving] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
 
   const loadSummary = useCallback(async (rootPath: string) => {
     setBusy(true);
@@ -135,6 +137,9 @@ export default function App() {
           )}
           <button className="btn primary" onClick={pickRoot} disabled={busy}>
             {busy ? "加载中…" : root ? "切项目" : "打开小说项目"}
+          </button>
+          <button className="btn" onClick={() => setShowCreate(true)} disabled={busy}>
+            ✨ 新建
           </button>
         </div>
       </header>
@@ -278,6 +283,17 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {showCreate && (
+        <CreateNovelModal
+          initialParent={root}
+          onClose={() => setShowCreate(false)}
+          onCreated={async (newRoot) => {
+            setShowCreate(false);
+            await loadSummary(newRoot);
+          }}
+        />
+      )}
     </div>
   );
 }

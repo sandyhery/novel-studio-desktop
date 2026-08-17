@@ -107,6 +107,41 @@ pub struct WriteChapterArgs {
     pub content: String,
 }
 
+/// 新建小说项目的全部要素（向导一次性收集，前端确认后整批下发）。
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNovelArgs {
+    /// 父目录（项目目录会创建在这里）
+    pub parent: String,
+    /// 项目名（同时作为目录名与默认标题的种子）
+    pub name: String,
+    pub title: String,
+    /// 视角：第一人称 / 第三人称 / 多重视角
+    pub pov_mode: String,
+    /// POV 主角名（povMode=多重视角时可空）
+    pub pov_character: String,
+    /// 类型（玄幻 / 都市 / 科幻 / 言情 / 历史 / 悬疑 / 其他）
+    pub genre: String,
+    /// 基调（轻松 / 严肃 / 黑暗 / 爽文 / 治愈）
+    pub tone: String,
+    /// 时代背景（架空 / 现代 / 未来 / 历史朝代名）
+    pub era: String,
+    /// 字数目标（万字）
+    pub target_words_wan: u32,
+    /// 卷数
+    pub volumes: u32,
+    /// 每卷章数
+    pub chapters_per_volume: u32,
+    /// 核心矛盾一句话
+    pub core_conflict: String,
+    /// 主角处境一句话
+    pub hero_situation: String,
+    /// 主角欲望一句话
+    pub hero_desire: String,
+    /// 第一幕核心冲突一句话
+    pub opening_hook: String,
+}
+
 // ---------------------------------------------------------------------------
 // 工具
 // ---------------------------------------------------------------------------
@@ -408,6 +443,229 @@ fn write_chapter(args: WriteChapterArgs) -> Result<(), String> {
     fs::write(&path, args.content.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+/// 新建小说项目：
+/// 1. 在 `parent` 下创建目录 `name`（如已存在则报错）
+/// 2. 调用 `agt novel-init <path> --title <title>` 生成骨架
+/// 3. 写入 `bible/world-rules.md`（题材/规模/开局要素）
+/// 4. 覆盖更新 `state.yml`（pov / world_date / next_hook 等）
+/// 5. 返回新建后的项目根路径
+#[tauri::command]
+fn create_novel(args: CreateNovelArgs) -> Result<String, String> {
+    use std::process::Command;
+
+    // 防呆：name 必须是目录名合法字符
+    if args.name.is_empty()
+        || args.name.contains('/')
+        || args.name.contains('\\')
+        || args.name == "."
+        || args.name == ".."
+    {
+        return Err("非法项目名（不能含 /，不能是 . / ..）".into());
+    }
+    if args.title.is_empty() {
+        return Err("标题不能为空".into());
+    }
+    if args.parent.is_empty() {
+        return Err("请先选父目录".into());
+    }
+
+    let parent = PathBuf::from(&args.parent);
+    if !parent.is_dir() {
+        return Err(format!("父目录不存在：{}", parent.display()));
+    }
+    let project_dir = parent.join(&args.name);
+    if project_dir.exists() {
+        return Err(format!(
+            "目标目录已存在：{}（换一个项目名或选别的父目录）",
+            project_dir.display()
+        ));
+    }
+    fs::create_dir_all(&project_dir)
+        .map_err(|e| format!("创建目录失败 {}: {e}", project_dir.display()))?;
+
+    // 调 agt novel-init（同步等待；超时 30s）
+    let init_out = Command::new("agt")
+        .arg("novel-init")
+        .arg(&project_dir)
+        .arg("--title")
+        .arg(&args.title)
+        .output();
+    let init_out = match init_out {
+        Ok(o) => o,
+        Err(e) => {
+            // 清理半成品
+            let _ = fs::remove_dir_all(&project_dir);
+            return Err(format!(
+                "调用 agt novel-init 失败：{}（确保 PATH 上有 agt）",
+                e
+            ));
+        }
+    };
+    if !init_out.status.success() {
+        let _ = fs::remove_dir_all(&project_dir);
+        return Err(format!(
+            "agt novel-init 退出码 {:?}：stderr={}",
+            init_out.status.code(),
+            String::from_utf8_lossy(&init_out.stderr)
+        ));
+    }
+
+    // 1. 写 world-rules.md（题材 / 规模 / 第一幕冲突的固化文档）
+    let total_chapters = args.volumes * args.chapters_per_volume;
+    let target_words: u64 = u64::from(args.target_words_wan) * 10_000;
+    let world_rules = format!(
+        "# 世界规则（题材与规模定稿）\n\n\
+         > 一旦写下即为定稿，正文引用本文件，不要在正文里另造。\n\n\
+         ## 题材\n\
+         - 类型：{genre}\n\
+         - 基调：{tone}\n\
+         - 时代背景：{era}\n\n\
+         ## 规模\n\
+         - 目标字数：{target_wan} 万字（约 {target_words} 字）\n\
+         - 卷数：{volumes}\n\
+         - 总章数：{total_ch} 章（每卷约 {cpv} 章）\n\
+         - 单章建议字数：约 {per_ch} 字（=目标字数/总章数）\n\n\
+         ## 视角\n\
+         - 视角：{pov_mode}\n\
+         - POV 主角：{pov_character}\n\n\
+         ## 开局要素\n\
+         - 核心矛盾：{core_conflict}\n\
+         - 主角处境：{hero_situation}\n\
+         - 主角欲望：{hero_desire}\n\
+         - 第一幕核心冲突：{opening_hook}\n\n\
+         ## 写作约束（自动派发）\n\
+         - **不许在正文里改设定**：角色、时间线、伏笔、世界规则只能改本档案，\n\
+           正文引用档案。本文件 = 单一源。\n\
+         - **每章收尾三件事**：角色状态回流 → `timeline.md` 追加 → `foreshadowing.md` 登记/销账\n\
+         - **回读一致性**：写完后回读本章涉及的角色档案与 timeline，确认无漂移\n",
+        genre = args.genre,
+        tone = args.tone,
+        era = args.era,
+        target_wan = args.target_words_wan,
+        target_words = target_words,
+        volumes = args.volumes,
+        total_ch = total_chapters,
+        cpv = args.chapters_per_volume,
+        per_ch = if total_chapters > 0 {
+            target_words / u64::from(total_chapters)
+        } else {
+            0
+        },
+        pov_mode = args.pov_mode,
+        pov_character = if args.pov_character.is_empty() {
+            "（多重视角）".to_string()
+        } else {
+            args.pov_character.clone()
+        },
+        core_conflict = args.core_conflict,
+        hero_situation = args.hero_situation,
+        hero_desire = args.hero_desire,
+        opening_hook = args.opening_hook,
+    );
+    let bible_dir = project_dir.join("bible");
+    fs::write(bible_dir.join("world-rules.md"), world_rules.as_bytes())
+        .map_err(|e| format!("写 bible/world-rules.md 失败: {e}"))?;
+
+    // 2. 重写 state.yml（保留原注释/结构，按键覆盖）
+    let today = chrono_like_today();
+    let state_content = format!(
+        "# 当前进度（每章更新）\n\n\
+         title: {title}\n\
+         current_chapter: 0        # 下一章编号（已写到 ch{{N}} → 填 N+1）\n\
+         world_date: \"{era} _ 第 N 章开篇\"     # 第一章开篇时填具体时间\n\
+         pov: \"{pov_char_for_state}\"           # 本章视角角色\n\
+         scene_characters: []      # 本章在场角色（开写前定，写后校准）\n\
+         next_hook: \"{opening_hook}\"\n\
+         done_chapters:\n\
+           - \"ch0: 大纲/设定\"\n\
+         blocked: []               # 卡点\n\
+         foreshadowing_open: 1     # 开篇埋伏笔 F001（见 bible/foreshadowing.md）\n\
+         updated: \"{today}\"\n",
+        title = args.title,
+        era = args.era,
+        pov_char_for_state = if args.pov_character.is_empty() {
+            "（多重视角）".to_string()
+        } else {
+            args.pov_character.clone()
+        },
+        opening_hook = args.opening_hook,
+        today = today,
+    );
+    fs::write(project_dir.join("state.yml"), state_content.as_bytes())
+        .map_err(|e| format!("写 state.yml 失败: {e}"))?;
+
+    // 3. 在 bible/foreshadowing.md 登记 F001：根据 opening_hook 包一行种子
+    let foreshadow_path = bible_dir.join("foreshadowing.md");
+    if let Ok(existing) = fs::read_to_string(&foreshadow_path) {
+        // 在表格里 `（追加）` 占位行前插一行
+        if let Some(idx) = existing.find("（追加）") {
+            let mut lines: Vec<&str> = existing.lines().collect();
+            let new_row = format!(
+                "| F001 | ch1 | {} | 开局埋设 | 埋设 | — |",
+                truncate_for_table_cell(&args.opening_hook, 40)
+            );
+            lines.insert(idx, new_row.as_str());
+            let updated = lines.join("\n");
+            fs::write(&foreshadow_path, updated.as_bytes())
+                .map_err(|e| format!("写 foreshadowing.md 失败: {e}"))?;
+        }
+    }
+
+    Ok(project_dir.to_string_lossy().to_string())
+}
+
+/// 取本地日期（不要引 chrono 库，用 std 拿）
+fn chrono_like_today() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    // 简单 days -> year/month/day 换算（Gregorian proleptic，不用 chrono）
+    let days = secs / 86_400;
+    let mut year = 1970;
+    let mut remaining = days;
+    loop {
+        let leap = is_leap(year);
+        let yd = if leap { 366 } else { 365 };
+        if remaining < yd {
+            break;
+        }
+        remaining -= yd;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1;
+    for m in &months {
+        if remaining < *m {
+            break;
+        }
+        remaining -= *m;
+        month += 1;
+    }
+    let day = remaining + 1;
+    format!("{:04}-{:02}-{:02}", year, month, day)
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// 把一段中文文本压缩成表格单元（去除换行 / 多余空格，截断到 n 字）
+fn truncate_for_table_cell(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() || *c == '_')
+        .collect();
+    if cleaned.chars().count() <= max_chars {
+        return cleaned;
+    }
+    let mut out: String = cleaned.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // entry
 // ---------------------------------------------------------------------------
@@ -421,7 +679,8 @@ pub fn run() {
             read_summary,
             read_bible,
             read_chapter,
-            write_chapter
+            write_chapter,
+            create_novel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
