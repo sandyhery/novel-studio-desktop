@@ -1,0 +1,28 @@
+{
+  "name": "novel-studio-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "写作工作台 — 一个轻量 Tauri 2 桌面应用，专门为 long-form fiction 设计，直接读取 agt novel-init 生成的 bible/chapters/state.yml，不需要 DSH Web 启动。",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-dialog": "^2"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4",
+    "@tauri-apps/cli": "^2"
+  }
+}
