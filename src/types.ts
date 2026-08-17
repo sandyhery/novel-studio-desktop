@@ -111,3 +111,15 @@ export function deriveSingleChapterWords(brief: NovelBrief): number {
   if (totalChapters <= 0) return 0;
   return Math.round(totalWords / totalChapters);
 }
+
+// ---------------------------------------------------------------------------
+// 路径诊断 — 前端用来显示"打开失败"时的友好提示 + 动作按钮
+// ---------------------------------------------------------------------------
+
+export type Probe =
+  | { kind: "missing"; path: string; parent: string; suggestedName: string }
+  | { kind: "fileNotDir"; path: string; parent: string; suggestedName: string }
+  | { kind: "emptyDir"; path: string; parent: string; suggestedName: string }
+  | { kind: "nonEmptyDir"; path: string; parent: string; suggestedName: string; sample: string[] }
+  | { kind: "novelSubdir"; path: string; parent: string; suggestedName: string; root: string }
+  | { kind: "novelRoot"; path: string; parent: string; suggestedName: string };

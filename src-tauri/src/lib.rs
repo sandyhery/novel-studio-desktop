@@ -364,8 +364,115 @@ fn title_from_state_or_dir(root: &Path, state_title: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Tauri 命令
+// Probe — 对一个路径的"诊断"，用于前端友好提示
 // ---------------------------------------------------------------------------
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ProbeKind {
+    /// 路径不存在（没创建过）
+    Missing,
+    /// 路径是个文件不是目录
+    FileNotDir,
+    /// 是空目录 —— 可以直接"原地初始化"成 novel-init
+    EmptyDir,
+    /// 是非空目录且有启发性内容，但不算 novel-init 项目
+    NonEmptyDir {
+        /// 头几条目名（最多 5），帮助用户识别这个目录是什么
+        sample: Vec<String>,
+    },
+    /// 是当前 novel 项目子目录（chapters/、bible/characters/xxx.md 之类）
+    NovelSubdir { root: String },
+    /// 就是 novel 项目根
+    NovelRoot,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeResult {
+    pub kind: ProbeKind,
+    /// 用户选的那个路径
+    pub path: String,
+    /// 父目录（用于"在这里新建"按钮）
+    pub parent: String,
+    /// 如果是 Missing 或 EmptyDir，目录名建议给向导预填
+    pub suggested_name: String,
+}
+
+/// 诊断一个路径：帮助前端决定显示什么提示 + 哪几个动作按钮
+#[tauri::command]
+fn probe_directory(path: String) -> Result<ProbeResult, String> {
+    let p = PathBuf::from(&path);
+    let parent = p
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let suggested_name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("novel")
+        .to_string();
+
+    if !p.exists() {
+        return Ok(ProbeResult {
+            kind: ProbeKind::Missing,
+            path: p.to_string_lossy().to_string(),
+            parent,
+            suggested_name,
+        });
+    }
+    if !p.is_dir() {
+        return Ok(ProbeResult {
+            kind: ProbeKind::FileNotDir,
+            path: p.to_string_lossy().to_string(),
+            parent,
+            suggested_name,
+        });
+    }
+    // 是不是 novel 项目根？
+    if is_novel_root(&p) {
+        return Ok(ProbeResult {
+            kind: ProbeKind::NovelRoot,
+            path: p.to_string_lossy().to_string(),
+            parent,
+            suggested_name,
+        });
+    }
+    // 是不是某个祖先链上的 novel 项目？
+    if let Some(root) = find_novel_root(&p) {
+        return Ok(ProbeResult {
+            kind: ProbeKind::NovelSubdir {
+                root: root.to_string_lossy().to_string(),
+            },
+            path: p.to_string_lossy().to_string(),
+            parent,
+            suggested_name,
+        });
+    }
+    // 不是 novel 项目。看是不是空目录
+    let mut entries: Vec<String> = fs::read_dir(&p)
+        .map_err(|e| format!("read_dir {}: {e}", p.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n != ".DS_Store")
+        .collect();
+    if entries.is_empty() {
+        return Ok(ProbeResult {
+            kind: ProbeKind::EmptyDir,
+            path: p.to_string_lossy().to_string(),
+            parent,
+            suggested_name,
+        });
+    }
+    entries.sort();
+    entries.truncate(5);
+    Ok(ProbeResult {
+        kind: ProbeKind::NonEmptyDir { sample: entries },
+        path: p.to_string_lossy().to_string(),
+        parent,
+        suggested_name,
+    })
+}
 
 /// 读项目总览：state.yml + bible/ + chapters/，一次性拿全。
 #[tauri::command]
@@ -680,8 +787,90 @@ pub fn run() {
             read_bible,
             read_chapter,
             write_chapter,
-            create_novel
+            create_novel,
+            probe_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    //! 集成路径探测，覆盖真实场景：用户选了空目录 / 项目子目录 / 不存在的路径。
+    //! 注意 macOS 会在新目录里立即建一个 `.DS_Store`，所以"空目录"判定要容忍它。
+
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn probe_missing_path() {
+        let path = std::env::temp_dir().join("dsh-novel-probe-missing-xyz-987");
+        let _ = fs::remove_dir_all(&path);
+        let r = probe_directory(path.to_string_lossy().to_string()).expect("call ok");
+        assert!(matches!(r.kind, ProbeKind::Missing), "got {:?}", r.kind);
+        assert!(!r.suggested_name.is_empty());
+    }
+
+    #[test]
+    fn probe_empty_dir_or_non_empty_dir() {
+        let p = std::env::temp_dir().join("dsh-novel-probe-empty-12345");
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        let r = probe_directory(p.to_string_lossy().to_string()).expect("call ok");
+        // macOS 通常会立刻写一个 .DS_Store；两种结果都接受
+        match r.kind {
+            ProbeKind::EmptyDir | ProbeKind::NonEmptyDir { .. } => {}
+            other => panic!("got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn probe_novel_root() {
+        let p = std::env::temp_dir().join("dsh-novel-probe-real-novel");
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        fs::create_dir_all(p.join("bible")).unwrap();
+        fs::write(p.join("state.yml"), "title: t\ncurrent_chapter: 0\n").unwrap();
+        let r = probe_directory(p.to_string_lossy().to_string()).expect("call ok");
+        assert!(matches!(r.kind, ProbeKind::NovelRoot), "got {:?}", r.kind);
+        assert_eq!(r.suggested_name, "dsh-novel-probe-real-novel");
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn probe_novel_subdir() {
+        let root = std::env::temp_dir().join("dsh-novel-probe-subdir-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("chapters").join("draft")).unwrap();
+        fs::create_dir_all(root.join("bible")).unwrap();
+        fs::write(root.join("state.yml"), "title: t\ncurrent_chapter: 0\n").unwrap();
+        let sub = root.join("chapters").join("draft");
+        let r = probe_directory(sub.to_string_lossy().to_string()).expect("call ok");
+        match r.kind {
+            ProbeKind::NovelSubdir { root: found } => {
+                assert!(found.ends_with("dsh-novel-probe-subdir-root"), "found={:?}", found);
+            }
+            other => panic!("got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn probe_nonexistent_chinese_path() {
+        let p = "/Users/zhouluyong/Documents/我的小说-does-not-exist-测试";
+        let r = probe_directory(p.to_string()).expect("call ok");
+        assert!(matches!(r.kind, ProbeKind::Missing), "got {:?}", r.kind);
+        assert_eq!(r.suggested_name, "我的小说-does-not-exist-测试");
+    }
+
+    #[test]
+    fn probe_real_user_novel_dir() {
+        // 用户之前一直在用的真实目录 /Users/zhouluyong/Documents/我的小说
+        // 我们之前用 agt novel-init 把它实化成了项目根，应该被识别为 NovelRoot。
+        // 如果这一项失败，意味着用户端的状态不一致 —— 用 ensure_agt_novel_init 修复。
+        let p = "/Users/zhouluyong/Documents/我的小说";
+        let r = probe_directory(p.to_string()).expect("call ok");
+        assert!(matches!(r.kind, ProbeKind::NovelRoot), "got {:?}", r.kind);
+    }
 }

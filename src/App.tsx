@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import type { BibleMeta, Chapter, NovelState, NovelSummary } from "./types";
+import type { BibleMeta, Chapter, NovelState, NovelSummary, Probe } from "./types";
 import { fmtChars, fmtDate } from "./types";
 import CreateNovelModal from "./CreateNovelModal";
 
@@ -27,27 +27,49 @@ export default function App() {
   const [chapterSaved, setChapterSaved] = useState<boolean>(true);
   const [saving, setSaving] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
+  const [probe, setProbe] = useState<Probe | null>(null);
+  const [probeFor, setProbeFor] = useState<string | null>(null);
+  const [briefInit, setBriefInit] = useState<{ parent?: string | null; name?: string } | null>(null);
 
-  const loadSummary = useCallback(async (rootPath: string) => {
-    setBusy(true);
-    setError(null);
+  const runProbe = useCallback(async (path: string) => {
     try {
-      const s = await invoke<NovelSummary>("read_summary", { root: rootPath });
-      if (!s.ok) {
-        setError("read_summary 返回 ok=false");
-        return;
-      }
-      setSummary(s);
-      setRoot(s.root);
-      setSelectedBible(null);
-      setBibleContent("");
+      const p = await invoke<Probe>("probe_directory", { path });
+      setProbe(p);
+      setProbeFor(path);
     } catch (e) {
+      setProbe(null);
+      setProbeFor(path);
       setError(String(e));
-      setSummary(null);
-    } finally {
-      setBusy(false);
     }
   }, []);
+
+  const loadSummary = useCallback(
+    async (rootPath: string) => {
+      setBusy(true);
+      setError(null);
+      setSummary(null);
+      setProbe(null);
+      setProbeFor(rootPath);
+      try {
+        const s = await invoke<NovelSummary>("read_summary", { root: rootPath });
+        if (!s.ok) {
+          setError("read_summary 返回 ok=false");
+          await runProbe(rootPath);
+          return;
+        }
+        setSummary(s);
+        setRoot(s.root);
+        setSelectedBible(null);
+        setBibleContent("");
+      } catch (e) {
+        setError(String(e));
+        await runProbe(rootPath);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [runProbe],
+  );
 
   const pickRoot = useCallback(async () => {
     try {
@@ -219,7 +241,7 @@ export default function App() {
         <main className="main">
           {error && <div className="error-banner">{error}</div>}
 
-          {!summary && !error && (
+          {!summary && !probe && !error && (
             <div className="empty">
               <h2>请选择小说项目目录</h2>
               <p className="muted">
@@ -228,7 +250,37 @@ export default function App() {
               <button className="btn primary" onClick={pickRoot}>
                 选目录
               </button>
+              <p className="muted small" style={{ marginTop: 16 }}>
+                或者
+              </p>
+              <button className="btn" onClick={() => setShowCreate(true)}>
+                ✨ 从零新建一本
+              </button>
             </div>
+          )}
+
+          {!summary && probe && (
+            <ProbeCard
+              probe={probe}
+              chosenPath={probeFor}
+              onChooseOther={pickRoot}
+              onInitInPlace={() => {
+                // 把向导预填为"在父目录里新建一个同名子目录"
+                setShowCreate(true);
+                const parent = probe?.parent ?? "";
+                const name = probe?.suggestedName ?? "";
+                setBriefInit({ parent, name });
+              }}
+              onInitAtParent={() => {
+                setShowCreate(true);
+                const parent = probe?.parent ?? "";
+                setBriefInit({ parent });
+              }}
+              onInitAtRoot={(root) => {
+                setShowCreate(true);
+                setBriefInit({ parent: root });
+              }}
+            />
           )}
 
           {summary && panel === "overview" && (
@@ -286,10 +338,15 @@ export default function App() {
 
       {showCreate && (
         <CreateNovelModal
-          initialParent={root}
-          onClose={() => setShowCreate(false)}
+          initialParent={briefInit?.parent ?? root}
+          initialName={briefInit?.name ?? ""}
+          onClose={() => {
+            setShowCreate(false);
+            setBriefInit(null);
+          }}
           onCreated={async (newRoot) => {
             setShowCreate(false);
+            setBriefInit(null);
             await loadSummary(newRoot);
           }}
         />
@@ -301,6 +358,95 @@ export default function App() {
 // ---------------------------------------------------------------------------
 // Panels
 // ---------------------------------------------------------------------------
+
+function ProbeCard(props: {
+  probe: Probe;
+  chosenPath: string | null;
+  onChooseOther: () => void;
+  onInitInPlace: (path: string) => void;
+  onInitAtParent: () => void;
+  onInitAtRoot: (root: string) => void;
+}) {
+  const { probe, chosenPath, onChooseOther, onInitInPlace, onInitAtParent, onInitAtRoot } = props;
+
+  let title = "未找到小说项目";
+  let body = "";
+  let action: React.ReactNode = null;
+
+  switch (probe.kind) {
+    case "missing":
+      title = "路径不存在";
+      body = `目录 ${probe.path} 还没创建。`;
+      action = (
+        <button className="btn primary" onClick={() => onInitInPlace(probe.path)}>
+          ✨ 在这里创建小说
+        </button>
+      );
+      break;
+    case "fileNotDir":
+      title = "这是个文件不是目录";
+      body = `${probe.path} 是文件。请选别的目录。`;
+      action = (
+        <button className="btn" onClick={onChooseOther}>选别的目录</button>
+      );
+      break;
+    case "emptyDir":
+      title = "这是空目录";
+      body = `${probe.path} 是空目录。原地跑 agt novel-init 就能创建项目。`;
+      action = (
+        <>
+          <button className="btn primary" onClick={() => onInitInPlace(probe.path)}>
+            ✨ 原地创建小说（项目名 = 「${probe.suggestedName}」）
+          </button>
+          <button className="btn" onClick={onChooseOther}>选别的</button>
+        </>
+      );
+      break;
+    case "nonEmptyDir":
+      title = "不是 novel 项目";
+      body = `${probe.path} 不是 novel-init 项目，里面有别的东西：${probe.sample.join("、")}`;
+      action = (
+        <>
+          <button className="btn primary" onClick={onInitAtParent}>
+            ✨ 在父目录新建一个子项目
+          </button>
+          <button className="btn" onClick={onChooseOther}>选别的</button>
+        </>
+      );
+      break;
+    case "novelSubdir":
+      title = "这是 novel 项目的子目录";
+      body = `选的是 ${probe.path}，但它在项目 ${probe.root} 里面。`;
+      action = (
+        <>
+          <button className="btn primary" onClick={() => onInitAtRoot(probe.root)}>
+            ↗ 打开整个项目（${probe.root}）
+          </button>
+          <button className="btn" onClick={onChooseOther}>选别的</button>
+        </>
+      );
+      break;
+    case "novelRoot":
+      title = "是 novel 项目";
+      body = `${probe.path} 正是项目根，但读取失败了。`;
+      break;
+  }
+
+  return (
+    <div className="panel">
+      <div className="diagnostic">
+        <h2>{title}</h2>
+        <p className="muted">{body}</p>
+        {chosenPath && (
+          <p className="muted small">
+            你选的路径：<code>{chosenPath}</code>
+          </p>
+        )}
+        <div className="diagnostic-actions">{action}</div>
+      </div>
+    </div>
+  );
+}
 
 function OverviewPanel(props: {
   state: NovelState;

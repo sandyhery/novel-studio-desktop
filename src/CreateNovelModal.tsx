@@ -20,6 +20,7 @@ interface CreateNovelModalProps {
   onClose: () => void;
   onCreated: (newProjectRoot: string) => void;
   initialParent?: string | null;
+  initialName?: string;
 }
 
 const STEP_LABELS = [
@@ -33,13 +34,14 @@ export default function CreateNovelModal({
   onClose,
   onCreated,
   initialParent = null,
+  initialName = "",
 }: CreateNovelModalProps) {
   const [step, setStep] = useState<Step>(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [brief, setBrief] = useState<NovelBrief>({
     parent: initialParent ?? "",
-    name: "",
+    name: initialName,
     title: "",
     povMode: "第三人称",
     povCharacter: "",
