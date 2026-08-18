@@ -1,6 +1,6 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { AiFullPipelineResult, AiReconcileBibleResult, AiWriteChapterResult } from "./types";
+import type { AiFullPipelineResult, AiReconcileBibleResult, AiWriteChapterResult, DshModelGroup } from "./types";
 import ChoiceModal, { type ChoiceRequest } from "./ChoiceModal";
 
 interface AiWritePanelProps {
@@ -34,6 +34,45 @@ export default function AiWritePanel({
   const [reconcileOutcome, setReconcileOutcome] = useState<string | null>(null);
   const [pipelineRunning, setPipelineRunning] = useState(false);
   const [pipelineResult, setPipelineResult] = useState<AiFullPipelineResult | null>(null);
+  const [modelGroups, setModelGroups] = useState<DshModelGroup[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [currentModel, setCurrentModel] = useState<string | null>(null);
+  const [switchingModel, setSwitchingModel] = useState(false);
+
+  // 拉取 DSH 可用模型目录（仅登录后）
+  useEffect(() => {
+    if (!dshLoggedIn) return;
+    let cancelled = false;
+    invoke<DshModelGroup[]>("dsh_list_models")
+      .then((groups) => {
+        if (cancelled) return;
+        setModelGroups(groups);
+      })
+      .catch(() => {
+        if (!cancelled) setModelGroups([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [dshLoggedIn]);
+
+  const switchModel = useCallback(async () => {
+    if (!selectedModel) return;
+    const [provider, model] = selectedModel.split("||");
+    if (!provider || !model) return;
+    setSwitchingModel(true);
+    setError(null);
+    try {
+      const label = await invoke<string>("dsh_select_model", {
+        args: { provider, model, reasoningEffort: null, root },
+      });
+      setCurrentModel(label);
+    } catch (e) {
+      setError(`切换模型失败：${String(e)}`);
+    } finally {
+      setSwitchingModel(false);
+    }
+  }, [selectedModel, root]);
 
   const startWrite = useCallback(async () => {
     setError(null);
@@ -192,6 +231,36 @@ export default function AiWritePanel({
           <span>⚠️ 未登录 DSH Web —— AI 写章节 / 审核需要先登录。</span>
           <div className="spacer" />
           <button className="btn primary" onClick={onLogin}>🔐 登录 DSH</button>
+        </div>
+      )}
+
+      {dshLoggedIn && (
+        <div className="toolbar" style={{ marginTop: 0 }}>
+          <span className="muted small">模型</span>
+          <select
+            className="search"
+            style={{ flex: 1, maxWidth: 420 }}
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value)}
+          >
+            <option value="">— 使用 DSH 默认{currentModel ? `（当前 ${currentModel}）` : ""} —</option>
+            {modelGroups.map((g) => (
+              <optgroup key={g.id} label={g.name}>
+                {g.models.map((m) => (
+                  <option key={`${g.id}||${m.id}`} value={`${g.id}||${m.id}`}>
+                    {m.name}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+          <button
+            className="btn"
+            onClick={switchModel}
+            disabled={!selectedModel || switchingModel}
+          >
+            {switchingModel ? "切换中…" : "切换"}
+          </button>
         </div>
       )}
 

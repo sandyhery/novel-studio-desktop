@@ -14,6 +14,7 @@
 //! 我们不引入 reqwest —— 用 std::net::TcpStream 写最简 HTTP/1.1 JSON POST，
 //! 保持零额外依赖。
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -324,6 +325,49 @@ pub fn session_create(
         .ok_or_else(|| DshError::Rpc("session.create no sessionId".into()))?
         .to_string();
     Ok(sid)
+}
+
+/// 一个 provider 下的模型条目。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// 一个 provider（含其下模型列表）。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelGroup {
+    pub id: String,
+    pub name: String,
+    pub models: Vec<ModelInfo>,
+}
+
+/// 拉取 host 级模型目录（llm.models，无需 sessionId）。
+pub fn list_models(port: u16) -> Result<Vec<ModelGroup>, DshError> {
+    let v = http_post_json(port, "llm.models", json!({}), DEFAULT_TIMEOUT_MS)?;
+    let groups = v.get("groups").cloned().unwrap_or(Value::Null);
+    serde_json::from_value(groups).map_err(|e| DshError::Rpc(format!("解析模型目录失败：{e}")))
+}
+
+/// 切换某个会话的模型（session.selectModel；DSH 会同时保存为默认）。
+pub fn select_model(
+    session_id: &str,
+    provider: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    port: u16,
+) -> Result<(), DshError> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("sessionId".into(), Value::String(session_id.to_string()));
+    payload.insert("provider".into(), Value::String(provider.to_string()));
+    payload.insert("model".into(), Value::String(model.to_string()));
+    if let Some(e) = reasoning_effort {
+        payload.insert("reasoningEffort".into(), Value::String(e.to_string()));
+    }
+    http_post_json(port, "session.selectModel", Value::Object(payload), DEFAULT_TIMEOUT_MS)?;
+    Ok(())
 }
 
 /// 往会话里提交一个 prompt（queue 模式，异步）。

@@ -1605,6 +1605,51 @@ fn dsh_login_status() -> Result<bool, String> {
     Ok(dsh_client::load_cookie().is_some())
 }
 
+/// 拉取 DSH 可用的大模型目录（provider → models）。
+#[tauri::command]
+fn dsh_list_models() -> Result<Vec<dsh_client::ModelGroup>, String> {
+    let port = dsh_client::default_port();
+    if !dsh_client::ping(port) {
+        return Err(format!("DSH Web 未运行（127.0.0.1:{port}）"));
+    }
+    dsh_client::list_models(port).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshSelectModelArgs {
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    /// 用于承载模型切换的会话工作目录（可选，默认 $HOME）。
+    pub root: Option<String>,
+}
+
+/// 切换 DSH 默认模型：临时建一个会话并 selectModel（DSH 会保存为默认）。
+#[tauri::command]
+fn dsh_select_model(args: DshSelectModelArgs) -> Result<String, String> {
+    let port = dsh_client::default_port();
+    if !dsh_client::ping(port) {
+        return Err(format!("DSH Web 未运行（127.0.0.1:{port}）"));
+    }
+    let cwd = args
+        .root
+        .filter(|r| !r.is_empty())
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "/tmp".to_string());
+    let sid = dsh_client::session_create(&cwd, None, Some("standard"), port)
+        .map_err(|e| format!("创建临时会话失败：{e}"))?;
+    dsh_client::select_model(
+        &sid,
+        &args.provider,
+        &args.model,
+        args.reasoning_effort.as_deref(),
+        port,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(format!("{}/{}", args.provider, args.model))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiWriteChapterArgs {
@@ -3085,7 +3130,9 @@ pub fn run() {
             read_changes,
             dsh_login,
             dsh_logout,
-            dsh_login_status
+            dsh_login_status,
+            dsh_list_models,
+            dsh_select_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

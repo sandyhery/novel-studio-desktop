@@ -385,3 +385,18 @@ export interface DshLoginResult {
   mfaToken: string | null;
   message: string;
 }
+
+// ---------------------------------------------------------------------------
+// DSH 大模型目录
+// ---------------------------------------------------------------------------
+
+export interface DshModelInfo {
+  id: string;
+  name: string;
+}
+
+export interface DshModelGroup {
+  id: string;
+  name: string;
+  models: DshModelInfo[];
+}
