@@ -810,12 +810,39 @@ fn create_novel(args: CreateNovelArgs) -> Result<String, String> {
         .map_err(|e| format!("创建目录失败 {}: {e}", project_dir.display()))?;
 
     // 调 agt novel-init（同步等待；超时 30s）
-    let init_out = Command::new("agt")
+    // 注意：Tauri app 从 Launch Services 启动，进程 PATH 是精简版（/usr/bin:/bin/...），
+    // 不含 ~/.local/bin / /opt/homebrew/bin 等用户工具目录。所以显式 prepend 进去，
+    // 让 `agt`（常装在 ~/.local/bin 或 brew 路径）也能被找到。
+    let user_bin = std::env::var("HOME")
+        .ok()
+        .map(|h| format!("{h}/.local/bin"))
+        .unwrap_or_default();
+    let extra = [
+        user_bin.as_str(),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
+    .iter()
+    .filter(|p| !p.is_empty())
+    .copied()
+    .collect::<Vec<_>>()
+    .join(":");
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let mut agt_cmd = Command::new("agt");
+    agt_cmd
         .arg("novel-init")
         .arg(&project_dir)
         .arg("--title")
         .arg(&args.title)
-        .output();
+        .env(
+            "PATH",
+            if current_path.is_empty() {
+                extra
+            } else {
+                format!("{extra}:{current_path}")
+            },
+        );
+    let init_out = agt_cmd.output();
     let init_out = match init_out {
         Ok(o) => o,
         Err(e) => {
