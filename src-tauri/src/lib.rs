@@ -1650,6 +1650,37 @@ fn dsh_select_model(args: DshSelectModelArgs) -> Result<String, String> {
     Ok(format!("{}/{}", args.provider, args.model))
 }
 
+/// 若指定了目标模型，把会话切过去，并返回原默认（供操作结束后恢复，避免改全局默认）。
+/// 返回 None 表示没有切换（没传 model 或已经就是该模型）。
+fn switch_model_temporarily(
+    sid: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    port: u16,
+) -> Result<Option<(String, String, Option<String>)>, String> {
+    let p = match provider {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(None),
+    };
+    let m = match model {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(None),
+    };
+    let cur = dsh_client::session_current_model(sid, port).map_err(|e| e.to_string())?;
+    if cur.0 == p && cur.1 == m {
+        return Ok(None);
+    }
+    dsh_client::select_model(sid, p, m, None, port).map_err(|e| e.to_string())?;
+    Ok(Some(cur))
+}
+
+/// 恢复原默认模型（若之前切换过）。失败静默——恢复失败不影响写作结果。
+fn restore_model(sid: &str, orig: Option<(String, String, Option<String>)>, port: u16) {
+    if let Some((p, m, e)) = orig {
+        let _ = dsh_client::select_model(sid, &p, &m, e.as_deref(), port);
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiWriteChapterArgs {
@@ -1658,6 +1689,10 @@ pub struct AiWriteChapterArgs {
     pub instruction: Option<String>,
     /// 会话 id（可选）：传了就复用，不传每次新建。
     pub session_id: Option<String>,
+    /// 可选：本次写作使用的模型 provider（如 deepseek-official / minimax-cn）。
+    pub model_provider: Option<String>,
+    /// 可选：本次写作使用的模型 id（如 deepseek-v4-pro / MiniMax-M2.7）。
+    pub model_id: Option<String>,
     /// 可选：等待超时（秒），默认 180。
     pub timeout_secs: Option<u64>,
     /// 可选：web 端口，默认 3080。
@@ -1792,6 +1827,14 @@ fn ai_write_chapter(args: AiWriteChapterArgs) -> Result<AiWriteChapterResult, St
     )
     .map_err(|e| format!("创建 DSH 会话失败：{e}"))?;
 
+    // 1.5 若指定了本次写作模型，临时切过去（结束后恢复默认）
+    let orig_model = switch_model_temporarily(
+        &sid,
+        args.model_provider.as_deref(),
+        args.model_id.as_deref(),
+        port,
+    )?;
+
     // 2. prompt
     dsh::session_prompt(&sid, &prompt, "queue", port).map_err(|e| format!("提交指令失败：{e}"))?;
 
@@ -1802,7 +1845,7 @@ fn ai_write_chapter(args: AiWriteChapterArgs) -> Result<AiWriteChapterResult, St
         ok: true,
         text: outcome.text.clone(),
         choice_request: outcome.choice_request.clone(),
-        session_id: Some(sid),
+        session_id: Some(sid.clone()),
         saved_to: None,
         error: None,
     };
@@ -1842,6 +1885,9 @@ fn ai_write_chapter(args: AiWriteChapterArgs) -> Result<AiWriteChapterResult, St
             let _ = updated;
         }
     }
+
+    // 恢复默认模型（若切换过）
+    restore_model(&sid, orig_model, port);
 
     Ok(result)
 }
@@ -2201,6 +2247,10 @@ pub struct AiReviewChapterArgs {
     /// 章节文件名（ch001.md 等）；缺省用最近一章
     pub chapter_file: Option<String>,
     pub session_id: Option<String>,
+    /// 可选：本次审核使用的模型 provider。
+    pub model_provider: Option<String>,
+    /// 可选：本次审核使用的模型 id。
+    pub model_id: Option<String>,
     pub timeout_secs: Option<u64>,
     pub port: Option<u16>,
 }
@@ -2354,6 +2404,15 @@ fn ai_review_chapter(args: AiReviewChapterArgs) -> Result<ReviewReport, String> 
         port,
     )
     .map_err(|e| format!("创建 DSH 会话失败：{e}"))?;
+
+    // 若指定了本次审核模型，临时切过去（结束后恢复默认）
+    let orig_model = switch_model_temporarily(
+        &sid,
+        args.model_provider.as_deref(),
+        args.model_id.as_deref(),
+        port,
+    )?;
+
     dsh::session_prompt(&sid, &prompt, "queue", port).map_err(|e| format!("提交指令失败：{e}"))?;
     let outcome = dsh::wait_for_assistant(&sid, port, timeout).map_err(|e| e.to_string())?;
 
@@ -2407,6 +2466,9 @@ fn ai_review_chapter(args: AiReviewChapterArgs) -> Result<ReviewReport, String> 
             let _ = fs::write(reviews_dir.join(fname), json.as_bytes());
         }
     }
+
+    // 恢复默认模型（若切换过）
+    restore_model(&sid, orig_model, port);
 
     Ok(report)
 }
@@ -2569,6 +2631,8 @@ fn ai_full_pipeline(args: AiFullPipelineArgs) -> Result<AiFullPipelineResult, St
         root: args.root.clone(),
         instruction: args.instruction.clone(),
         session_id: session_id.clone(),
+        model_provider: None,
+        model_id: None,
         timeout_secs: Some(timeout.min(300)),
         port: Some(port),
     })?;
@@ -2603,6 +2667,8 @@ fn ai_full_pipeline(args: AiFullPipelineArgs) -> Result<AiFullPipelineResult, St
         root: args.root.clone(),
         chapter_file: Some(chapter_file.clone()),
         session_id: session_id.clone(),
+        model_provider: None,
+        model_id: None,
         timeout_secs: Some(timeout.min(240)),
         port: Some(port),
     })?;
@@ -3498,6 +3564,8 @@ mod tests {
             root: p.to_string(),
             instruction: Some("写第一章（ch001.md），大约 600-1000 字即可（测试用短章）。主角登场，结尾留一个钩子。".to_string()),
             session_id: None,
+            model_provider: None,
+            model_id: None,
             timeout_secs: Some(240),
             port: Some(3080),
         })
@@ -3652,6 +3720,8 @@ mod tests {
             root: p.to_string(),
             chapter_file: None,
             session_id: None,
+            model_provider: None,
+            model_id: None,
             timeout_secs: Some(240),
             port: Some(3080),
         })

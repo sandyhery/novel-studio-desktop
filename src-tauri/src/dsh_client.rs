@@ -370,6 +370,31 @@ pub fn select_model(
     Ok(())
 }
 
+/// 读某会话当前的模型选择（provider, model, reasoningEffort）。
+pub fn session_current_model(
+    session_id: &str,
+    port: u16,
+) -> Result<(String, String, Option<String>), DshError> {
+    let payload = json!({ "sessionId": session_id });
+    let v = http_post_json(port, "session.models", payload, DEFAULT_TIMEOUT_MS)?;
+    let cur = v.get("current").cloned().unwrap_or(Value::Null);
+    let provider = cur
+        .get("provider")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model = cur
+        .get("model")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let effort = cur
+        .get("reasoningEffort")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    Ok((provider, model, effort))
+}
+
 /// 往会话里提交一个 prompt（queue 模式，异步）。
 pub fn session_prompt(
     session_id: &str,

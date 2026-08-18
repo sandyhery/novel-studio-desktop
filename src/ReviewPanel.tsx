@@ -1,7 +1,8 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   type AiReviseChapterResult,
+  type DshModelGroup,
   type ReviewReport,
   REVIEW_CATEGORY_ORDER,
 } from "./types";
@@ -35,17 +36,46 @@ export default function ReviewPanel({
   const [busy, setBusy] = useState(false);
   const [revising, setRevising] = useState(false);
   const [revisedText, setRevisedText] = useState<string | null>(null);
+  const [modelGroups, setModelGroups] = useState<DshModelGroup[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+
+  // 拉取 DSH 可用模型目录（仅登录后）
+  useEffect(() => {
+    if (!dshLoggedIn) return;
+    let cancelled = false;
+    invoke<DshModelGroup[]>("dsh_list_models")
+      .then((groups) => {
+        if (cancelled) return;
+        setModelGroups(groups);
+      })
+      .catch(() => {
+        if (!cancelled) setModelGroups([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [dshLoggedIn]);
+
+  // 从 "provider||model" 拆出本次审核要用的模型（空则用 DSH 默认）
+  const modelSelection = useCallback(() => {
+    if (!selectedModel) return { modelProvider: null as string | null, modelId: null as string | null };
+    const [provider, model] = selectedModel.split("||");
+    return { modelProvider: provider || null, modelId: model || null };
+  }, [selectedModel]);
 
   const review = useCallback(async (target?: string) => {
     setBusy(true);
     setError(null);
     setRevisedText(null);
+    const { modelProvider, modelId } = modelSelection();
     try {
       const r = await invoke<ReviewReport>("ai_review_chapter", {
         args: {
           root,
           chapterFile: target || null,
           sessionId: sessionId ?? null,
+          modelProvider,
+          modelId,
           timeoutSecs: 300,
         },
       });
@@ -57,7 +87,7 @@ export default function ReviewPanel({
     } finally {
       setBusy(false);
     }
-  }, [root, sessionId, onSessionId]);
+  }, [root, sessionId, onSessionId, modelSelection]);
 
   const revise = useCallback(async () => {
     if (!report) return;
@@ -105,6 +135,29 @@ export default function ReviewPanel({
       <div className="toolbar" style={{ marginTop: 0 }}>
         <h2 className="section-title" style={{ margin: 0 }}>🛡️ AI 审核员</h2>
         <div className="spacer" />
+        {dshLoggedIn && (
+          <>
+            <span className="muted small">审核模型</span>
+            <select
+              className="search"
+              style={{ maxWidth: 300 }}
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              title="本次审核使用的模型（用完自动恢复默认，不改全局）"
+            >
+              <option value="">跟随 DSH 默认</option>
+              {modelGroups.map((g) => (
+                <optgroup key={g.id} label={g.name}>
+                  {g.models.map((m) => (
+                    <option key={`${g.id}||${m.id}`} value={`${g.id}||${m.id}`}>
+                      {m.name}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </>
+        )}
         <button className="btn primary" onClick={() => review()} disabled={busy}>
           {busy ? "审核中…" : "审核最近一章"}
         </button>

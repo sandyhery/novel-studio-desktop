@@ -36,8 +36,6 @@ export default function AiWritePanel({
   const [pipelineResult, setPipelineResult] = useState<AiFullPipelineResult | null>(null);
   const [modelGroups, setModelGroups] = useState<DshModelGroup[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
-  const [currentModel, setCurrentModel] = useState<string | null>(null);
-  const [switchingModel, setSwitchingModel] = useState(false);
 
   // 拉取 DSH 可用模型目录（仅登录后）
   useEffect(() => {
@@ -56,35 +54,27 @@ export default function AiWritePanel({
     };
   }, [dshLoggedIn]);
 
-  const switchModel = useCallback(async () => {
-    if (!selectedModel) return;
+  // 从 "provider||model" 拆出本次写作要用的模型（空则用 DSH 默认）
+  const modelSelection = useCallback(() => {
+    if (!selectedModel) return { modelProvider: null as string | null, modelId: null as string | null };
     const [provider, model] = selectedModel.split("||");
-    if (!provider || !model) return;
-    setSwitchingModel(true);
-    setError(null);
-    try {
-      const label = await invoke<string>("dsh_select_model", {
-        args: { provider, model, reasoningEffort: null, root },
-      });
-      setCurrentModel(label);
-    } catch (e) {
-      setError(`切换模型失败：${String(e)}`);
-    } finally {
-      setSwitchingModel(false);
-    }
-  }, [selectedModel, root]);
+    return { modelProvider: provider || null, modelId: model || null };
+  }, [selectedModel]);
 
   const startWrite = useCallback(async () => {
     setError(null);
     setResult(null);
     setPhase("running");
     setProgress("正在创建 DSH 会话并让 AI 写作…（长文可能需 1-3 分钟）");
+    const { modelProvider, modelId } = modelSelection();
     try {
       const res = await invoke<AiWriteChapterResult>("ai_write_chapter", {
         args: {
           root,
           instruction: instruction.trim() || null,
           sessionId: sessionId ?? null,
+          modelProvider,
+          modelId,
           timeoutSecs: 300,
         },
       });
@@ -110,7 +100,7 @@ export default function AiWritePanel({
       setError(String(e));
       setPhase("error");
     }
-  }, [root, instruction, sessionId, onSessionId, onSaved]);
+  }, [root, instruction, sessionId, onSessionId, onSaved, modelSelection]);
 
   const confirmChoice = useCallback(async () => {
     if (!choiceReq || !pickedOption) return;
@@ -124,12 +114,15 @@ export default function AiWritePanel({
         : `之前我让你在抉择点停下来。人类已决定选择：「${chosen?.label ?? pickedOption}」。${note ? `备注：${note}` : ""} 请基于这个决定继续写下去（不要重写已写内容）。`;
     setInstruction(continueText);
     setProgress("已收到你的决定，AI 继续写作…");
+    const { modelProvider, modelId } = modelSelection();
     try {
       const res = await invoke<AiWriteChapterResult>("ai_write_chapter", {
         args: {
           root,
           instruction: continueText,
           sessionId: sessionId ?? null,
+          modelProvider,
+          modelId,
           timeoutSecs: 300,
         },
       });
@@ -149,7 +142,7 @@ export default function AiWritePanel({
       setError(String(e));
       setPhase("error");
     }
-  }, [choiceReq, pickedOption, note, root, sessionId, onSessionId, onSaved]);
+  }, [choiceReq, pickedOption, note, root, sessionId, onSessionId, onSaved, modelSelection]);
 
   const cancelChoice = useCallback(() => {
     setChoiceReq(null);
@@ -236,14 +229,15 @@ export default function AiWritePanel({
 
       {dshLoggedIn && (
         <div className="toolbar" style={{ marginTop: 0 }}>
-          <span className="muted small">模型</span>
+          <span className="muted small">写作模型</span>
           <select
             className="search"
             style={{ flex: 1, maxWidth: 420 }}
             value={selectedModel}
             onChange={(e) => setSelectedModel(e.target.value)}
+            title="本次写作使用的模型（用完自动恢复默认，不改全局）"
           >
-            <option value="">— 使用 DSH 默认{currentModel ? `（当前 ${currentModel}）` : ""} —</option>
+            <option value="">— 跟随 DSH 默认 —</option>
             {modelGroups.map((g) => (
               <optgroup key={g.id} label={g.name}>
                 {g.models.map((m) => (
@@ -254,13 +248,6 @@ export default function AiWritePanel({
               </optgroup>
             ))}
           </select>
-          <button
-            className="btn"
-            onClick={switchModel}
-            disabled={!selectedModel || switchingModel}
-          >
-            {switchingModel ? "切换中…" : "切换"}
-          </button>
         </div>
       )}
 
