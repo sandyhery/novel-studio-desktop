@@ -9,6 +9,7 @@ import StoryboardPanel from "./StoryboardPanel";
 import AiWritePanel from "./AiWritePanel";
 import ReviewPanel from "./ReviewPanel";
 import MarkdownView from "./MarkdownView";
+import DshLoginModal from "./DshLoginModal";
 
 type Panel = "overview" | "chapters" | "bible" | "editor" | "storyboard" | "aiwrite" | "review";
 
@@ -62,6 +63,8 @@ export default function App() {
   const [lineHeight, setLineHeight] = useState<number>(() => readPrefNumber("novelStudio.lineHeight", 1.85, 1.2, 3));
   const [milestoneEvery, setMilestoneEvery] = useState<number>(() => readPrefNumber("novelStudio.milestoneEvery", 5, 0, 100));
   const [gitNotice, setGitNotice] = useState<{ text: string; tone: "ok" | "warn" | "error" } | null>(null);
+  const [dshLoggedIn, setDshLoggedIn] = useState(false);
+  const [showDshLogin, setShowDshLogin] = useState(false);
 
   const changeFontSize = useCallback((n: number) => {
     setFontSize(n);
@@ -203,6 +206,21 @@ export default function App() {
     // 这里不强求自动加载，避免误打开用户其它路径
     pickRoot();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 启动时检查 DSH Web 登录态（是否有保存的 session cookie）
+  useEffect(() => {
+    let cancelled = false;
+    invoke<boolean>("dsh_login_status")
+      .then((ok) => {
+        if (!cancelled) setDshLoggedIn(ok);
+      })
+      .catch(() => {
+        if (!cancelled) setDshLoggedIn(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const openBible = useCallback(async (sel: BibleSelection) => {
@@ -385,6 +403,21 @@ export default function App() {
           </button>
           <button className="btn" onClick={() => setShowCreate(true)} disabled={busy}>
             ✨ 新建
+          </button>
+          <button
+            className={`btn ${dshLoggedIn ? "" : "primary"}`}
+            onClick={() => {
+              if (dshLoggedIn) {
+                invoke<boolean>("dsh_logout")
+                  .then(() => setDshLoggedIn(false))
+                  .catch(() => {});
+              } else {
+                setShowDshLogin(true);
+              }
+            }}
+            title={dshLoggedIn ? "已登录 DSH Web，点击登出" : "登录 DSH Web（AI 写章节/审核需要）"}
+          >
+            {dshLoggedIn ? "🔓 DSH 已登录" : "🔐 登录 DSH"}
           </button>
         </div>
       </header>
@@ -596,6 +629,8 @@ export default function App() {
               sessionId={dshSessionId}
               onSessionId={setDshSessionId}
               onSaved={() => loadSummary(summary.root)}
+              dshLoggedIn={dshLoggedIn}
+              onLogin={() => setShowDshLogin(true)}
             />
           )}
 
@@ -605,6 +640,8 @@ export default function App() {
               sessionId={dshSessionId}
               onSessionId={setDshSessionId}
               onSaved={() => loadSummary(summary.root)}
+              dshLoggedIn={dshLoggedIn}
+              onLogin={() => setShowDshLogin(true)}
             />
           )}
 
@@ -625,6 +662,13 @@ export default function App() {
             setBriefInit(null);
             await loadSummary(newRoot);
           }}
+        />
+      )}
+
+      {showDshLogin && (
+        <DshLoginModal
+          onClose={() => setShowDshLogin(false)}
+          onLoggedIn={() => setDshLoggedIn(true)}
         />
       )}
 

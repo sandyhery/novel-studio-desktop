@@ -374,3 +374,14 @@ export interface ReadChangesResult {
   changed: boolean;
   stamps: FileStamp[];
 }
+
+// ---------------------------------------------------------------------------
+// DSH Web 登录
+// ---------------------------------------------------------------------------
+
+export interface DshLoginResult {
+  ok: boolean;
+  mfaRequired: boolean;
+  mfaToken: string | null;
+  message: string;
+}

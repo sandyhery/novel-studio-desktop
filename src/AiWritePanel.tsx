@@ -8,6 +8,8 @@ interface AiWritePanelProps {
   sessionId?: string | null;
   onSessionId?: (sid: string | null) => void;
   onSaved?: () => void; // 章节保存后刷新
+  dshLoggedIn?: boolean;
+  onLogin?: () => void;
 }
 
 type Phase = "idle" | "running" | "choice" | "done" | "error";
@@ -17,6 +19,8 @@ export default function AiWritePanel({
   sessionId,
   onSessionId,
   onSaved,
+  dshLoggedIn,
+  onLogin,
 }: AiWritePanelProps) {
   const [instruction, setInstruction] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
@@ -182,6 +186,14 @@ export default function AiWritePanel({
   return (
     <div className="panel">
       <h2 className="section-title">✨ AI 写章节</h2>
+
+      {dshLoggedIn === false && (
+        <div className="external-banner">
+          <span>⚠️ 未登录 DSH Web —— AI 写章节 / 审核需要先登录。</span>
+          <div className="spacer" />
+          <button className="btn primary" onClick={onLogin}>🔐 登录 DSH</button>
+        </div>
+      )}
 
       <textarea
         className="md-editor small"

@@ -1539,6 +1539,72 @@ fn read_story_spine(root: String) -> Result<StorySpine, String> {
 //
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// DSH Web 登录（桌面端驱动 agent 前需要先登录拿 session cookie）
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshLoginArgs {
+    pub username: String,
+    pub password: String,
+    /// TOTP 二步验证码（有 TOTP 的账号第二步才填）
+    pub code: Option<String>,
+    /// 第一步登录返回的 mfaToken（有 TOTP 时第二步回传）
+    pub mfa_token: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshLoginResult {
+    pub ok: bool,
+    pub mfa_required: bool,
+    pub mfa_token: Option<String>,
+    pub message: String,
+}
+
+/// 登录 DSH Web。无 TOTP 的账号一次成功；有 TOTP 的账号先返回 mfaRequired + mfaToken，
+/// 前端再让用户输 code 调第二次。
+#[tauri::command]
+fn dsh_login(args: DshLoginArgs) -> Result<DshLoginResult, String> {
+    let port = args.port.unwrap_or(dsh_client::default_port());
+    if !dsh_client::ping(port) {
+        return Ok(DshLoginResult {
+            ok: false,
+            mfa_required: false,
+            mfa_token: None,
+            message: format!("DSH Web 未运行（127.0.0.1:{port}）"),
+        });
+    }
+    let out = dsh_client::login(
+        &args.username,
+        &args.password,
+        args.code.as_deref(),
+        args.mfa_token.as_deref(),
+        port,
+    );
+    Ok(DshLoginResult {
+        ok: out.ok,
+        mfa_required: out.mfa_required,
+        mfa_token: out.mfa_token,
+        message: out.message,
+    })
+}
+
+/// 登出：清除已保存的会话 cookie。
+#[tauri::command]
+fn dsh_logout() -> Result<bool, String> {
+    dsh_client::clear_cookie();
+    Ok(true)
+}
+
+/// 是否已有保存的会话 cookie（粗略判断登录态）。
+#[tauri::command]
+fn dsh_login_status() -> Result<bool, String> {
+    Ok(dsh_client::load_cookie().is_some())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiWriteChapterArgs {
@@ -3016,7 +3082,10 @@ pub fn run() {
             read_story_spine,
             git_commit,
             git_init,
-            read_changes
+            read_changes,
+            dsh_login,
+            dsh_logout,
+            dsh_login_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

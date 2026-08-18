@@ -41,6 +41,225 @@ impl std::fmt::Display for DshError {
 
 impl std::error::Error for DshError {}
 
+/// 原始 HTTP 响应（head 原文 + 解码后的 body）。
+struct HttpResponse {
+    status: u16,
+    head: String,
+    body: String,
+}
+
+/// 发一个 POST，返回原始响应（不判状态码）。支持可选 Cookie 头。
+/// `path` 形如 `/api/session.create` 或 `/auth/login`。
+fn http_post_raw(
+    port: u16,
+    path: &str,
+    body_str: &str,
+    cookie: Option<&str>,
+    timeout_ms: u64,
+) -> Result<HttpResponse, DshError> {
+    let cookie_line = match cookie {
+        Some(c) if !c.is_empty() => format!("Cookie: {c}\r\n"),
+        _ => String::new(),
+    };
+    let req = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         {}Connection: close\r\n\
+         \r\n\
+         {}",
+        body_str.len(),
+        cookie_line,
+        body_str
+    );
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = TcpStream::connect(&addr).map_err(|e| DshError::Io(e.to_string()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
+        .map_err(|e| DshError::Io(e.to_string()))?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| DshError::Io(e.to_string()))?;
+    stream
+        .flush()
+        .map_err(|e| DshError::Io(e.to_string()))?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).map_err(|e| DshError::Io(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+
+    let split = text.find("\r\n\r\n").ok_or_else(|| DshError::Http("no header separator".into()))?;
+    let head = text[..split].to_string();
+    let body_text = &text[split + 4..];
+
+    let status_line = head.lines().next().unwrap_or("");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
+    let body = if chunked {
+        decode_chunked(body_text).map_err(DshError::Http)?
+    } else {
+        body_text.to_string()
+    };
+
+    Ok(HttpResponse { status, head, body })
+}
+
+/// 从响应头里提取 Set-Cookie 的第一个 `name=value`（不含属性）。
+fn extract_cookie(head: &str) -> Option<String> {
+    for line in head.lines() {
+        if !line.to_ascii_lowercase().starts_with("set-cookie:") {
+            continue;
+        }
+        let v = line.trim_start_matches(|c| c == ' ' || c == '\t');
+        let v = v.strip_prefix("Set-Cookie:").or_else(|| v.strip_prefix("set-cookie:"))?;
+        let v = v.trim();
+        // 取第一个 ; 之前的 name=value 部分
+        let pair = v.split(';').next().unwrap_or(v).trim();
+        if pair.contains('=') {
+            return Some(pair.to_string());
+        }
+    }
+    None
+}
+
+/// 加载已保存的 DSH Web 会话 cookie（登录后持久化到 ~/.dsh/novel-studio-desktop.cookie）。
+pub fn load_cookie() -> Option<String> {
+    let path = cookie_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn cookie_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join(".dsh")
+        .join("novel-studio-desktop.cookie")
+}
+
+fn save_cookie(cookie: &str) -> std::io::Result<()> {
+    let path = cookie_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, cookie.as_bytes())
+}
+
+/// 清除已保存的会话 cookie（登出）。
+pub fn clear_cookie() {
+    let _ = std::fs::remove_file(cookie_path());
+}
+
+/// 登录结果：可能直接拿到 cookie，也可能需要再输 TOTP 码。
+#[derive(Debug)]
+pub struct LoginOutcome {
+    pub ok: bool,
+    pub mfa_required: bool,
+    pub mfa_token: Option<String>,
+    pub cookie: Option<String>,
+    pub message: String,
+}
+
+/// 登录 DSH Web：先账号密码，若要求 TOTP 再用 code 换 cookie。
+pub fn login(
+    username: &str,
+    password: &str,
+    code: Option<&str>,
+    mfa_token: Option<&str>,
+    port: u16,
+) -> LoginOutcome {
+    // 二步：用 mfaToken + code 换 session
+    let path = if code.is_some() || mfa_token.is_some() {
+        "/auth/mfa/login"
+    } else {
+        "/auth/login"
+    };
+    let payload = if code.is_some() || mfa_token.is_some() {
+        json!({ "mfaToken": mfa_token.unwrap_or(""), "code": code.unwrap_or("") })
+    } else {
+        json!({ "username": username, "password": password })
+    };
+
+    let resp = match http_post_raw(port, path, &payload.to_string(), None, 15_000) {
+        Ok(r) => r,
+        Err(e) => {
+            return LoginOutcome {
+                ok: false,
+                mfa_required: false,
+                mfa_token: None,
+                cookie: None,
+                message: e.to_string(),
+            }
+        }
+    };
+
+    let data: Value = match serde_json::from_str(&resp.body) {
+        Ok(v) => v,
+        Err(_) => {
+            return LoginOutcome {
+                ok: false,
+                mfa_required: false,
+                mfa_token: None,
+                cookie: None,
+                message: format!("登录响应解析失败（status {}）", resp.status),
+            }
+        }
+    };
+
+    // 需要 TOTP 二步
+    if data.get("mfaRequired").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let token = data.get("mfaToken").and_then(|v| v.as_str()).map(|s| s.to_string());
+        return LoginOutcome {
+            ok: false,
+            mfa_required: true,
+            mfa_token: token,
+            cookie: None,
+            message: "需要二步验证码（TOTP）".into(),
+        };
+    }
+
+    // 成功：从 Set-Cookie 提取会话 cookie
+    if resp.status == 200 {
+        if let Some(cookie) = extract_cookie(&resp.head) {
+            let _ = save_cookie(&cookie);
+            return LoginOutcome {
+                ok: true,
+                mfa_required: false,
+                mfa_token: None,
+                cookie: Some(cookie),
+                message: "已登录".into(),
+            };
+        }
+    }
+
+    let err = data.get("error").and_then(|v| v.as_str()).unwrap_or("登录失败");
+    LoginOutcome {
+        ok: false,
+        mfa_required: false,
+        mfa_token: None,
+        cookie: None,
+        message: err.to_string(),
+    }
+}
+
 fn http_post_json(
     port: u16,
     method: &str,
@@ -56,64 +275,18 @@ fn http_post_json(
     .to_string();
 
     let path = format!("/api/{method}");
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: 127.0.0.1:{port}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    );
+    let cookie = load_cookie();
+    let resp = http_post_raw(port, &path, &body, cookie.as_deref(), timeout_ms)?;
 
-    let addr = format!("127.0.0.1:{port}");
-    let mut stream = TcpStream::connect(&addr).map_err(|e| DshError::Io(e.to_string()))?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
-        .map_err(|e| DshError::Io(e.to_string()))?;
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| DshError::Io(e.to_string()))?;
-    stream
-        .flush()
-        .map_err(|e| DshError::Io(e.to_string()))?;
-
-    // 读响应：先读 head 拿 Content-Length，再读 body
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    // 简单粗暴：读完整个连接直到 EOF（服务端 Connection: close）
-    loop {
-        let n = stream.read(&mut chunk).map_err(|e| DshError::Io(e.to_string()))?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let text = String::from_utf8_lossy(&buf).to_string();
-
-    // 分离 head/body
-    let split = text.find("\r\n\r\n").ok_or_else(|| DshError::Http("no header separator".into()))?;
-    let head = &text[..split];
-    let body_text = &text[split + 4..];
-
-    // 状态码
-    let status_line = head.lines().next().unwrap_or("");
-    if !status_line.contains(" 200") {
-        return Err(DshError::Http(format!("status {status_line}: {body_text}")));
+    if resp.status != 200 {
+        return Err(DshError::Http(format!(
+            "status HTTP/1.1 {}: {}",
+            resp.status, resp.body
+        )));
     }
 
-    // 处理 chunked transfer-encoding（server 可能用 a0\r\n...\r\n0\r\n\r\n 分块）
-    let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
-    let body_text = if chunked {
-        decode_chunked(body_text).map_err(DshError::Http)?
-    } else {
-        body_text.to_string()
-    };
-
-    let v: Value = serde_json::from_str(&body_text)
-        .map_err(|e| DshError::Http(format!("bad json: {e}; raw={body_text}")))?;
+    let v: Value = serde_json::from_str(&resp.body)
+        .map_err(|e| DshError::Http(format!("bad json: {e}; raw={}", resp.body)))?;
 
     // 检查 envelope
     if v.get("type").and_then(|t| t.as_str()) != Some("server-response") {

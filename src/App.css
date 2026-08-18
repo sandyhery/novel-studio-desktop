@@ -1208,3 +1208,16 @@ code {
   gap: 10px;
   flex-wrap: wrap;
 }
+
+/* ---------- 表单输入框（.search 基础样式，供各 modal 复用） ---------- */
+.search {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+}
+.search:focus { outline: none; border-color: var(--accent); }
+.search:disabled { opacity: 0.6; }

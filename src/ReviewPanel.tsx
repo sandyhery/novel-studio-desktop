@@ -11,6 +11,8 @@ interface ReviewPanelProps {
   sessionId?: string | null;
   onSessionId?: (sid: string | null) => void;
   onSaved?: () => void;
+  dshLoggedIn?: boolean;
+  onLogin?: () => void;
 }
 
 const SEVERITY_TONE: Record<string, string> = {
@@ -25,6 +27,8 @@ export default function ReviewPanel({
   sessionId,
   onSessionId,
   onSaved,
+  dshLoggedIn,
+  onLogin,
 }: ReviewPanelProps) {
   const [report, setReport] = useState<ReviewReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -90,6 +94,14 @@ export default function ReviewPanel({
 
   return (
     <div className="panel">
+      {dshLoggedIn === false && (
+        <div className="external-banner">
+          <span>⚠️ 未登录 DSH Web —— AI 审核需要先登录。</span>
+          <div className="spacer" />
+          <button className="btn primary" onClick={onLogin}>🔐 登录 DSH</button>
+        </div>
+      )}
+
       <div className="toolbar" style={{ marginTop: 0 }}>
         <h2 className="section-title" style={{ margin: 0 }}>🛡️ AI 审核员</h2>
         <div className="spacer" />
